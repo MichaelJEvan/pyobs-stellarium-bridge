@@ -1,0 +1,28 @@
+# Copy this to config.yaml and put your own values in.
+# config.yaml is gitignored; this file is not, so keep real values out of it.
+#
+# Anything you leave out falls back to the defaults in bridge.py, and if
+# config.yaml is missing entirely the bridge runs on those defaults.
+
+pyobs:
+  server: <pyobs-host>:5222      # the machine running ejabberd
+  jid: stellarium@localhost      # this bridge's own account -- not shared
+  password: <password>
+  module: telescope              # the pyobs module to follow
+
+site:                            # only used to annotate logs with altitude
+  latitude: 0.0
+  longitude: 0.0
+  elevation: 0.0
+
+listen:                          # where Stellarium connects
+  host: 127.0.0.1
+  port: 10001
+
+slewto:                          # the command-line slew tool
+                                 # (its own account -- never shared)
+  jid: scratch@localhost   # a second account, not the bridge's
+
+scope:                           # the interactive console
+                                 # (its own account -- never shared)
+  jid: console@localhost

@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+
+"""*******************************************************************************
+
+    Developer: Michael J. Evan
+    August 2026
+    Masters Computer Science
+    University of Massachusetts Dartmouth - Dec 2026
+    AAVSO member
+
+    Bridge between Stellarium's Telescope Control plugin and a pyobs telescope.
+
+    Stellarium connects as a TCP client; reports the telescope's position
+    ~1 Hz and forward its "slew" commands to pyobs.
+
+*******************************************************************************"""
+
+import asyncio
+import contextlib
+import logging
+import pathlib
+import struct
+import time
+
+# slixmpp logs a stringprep warning the moment it is imported, before anything
+# has had a chance to configure logging. Silence it first or every tool that
+# touches pyobs opens with it.
+logging.getLogger("slixmpp.stringprep").setLevel(logging.ERROR)
+
+# slixmpp narrates its own connection ("JID set to...", "Connected to
+# server.") which duplicates what we log either side of it, in a different
+# format. Warnings and errors from it still come through.
+logging.getLogger("slixmpp").setLevel(logging.WARNING)
+# pyobs's own client says "Connected to server." between our two lines saying
+# the same thing. Its sibling xmppcomm is left alone -- that one reports
+# disconnects and reconnects, which are worth seeing.
+logging.getLogger("pyobs.comm.xmpp.xmppclient").setLevel(logging.WARNING)
+
+try:
+    from astropy.coordinates import AltAz, EarthLocation, SkyCoord
+    from astropy.time import Time
+    import astropy.units as u
+except ImportError:      # altitude annotations are a nicety, not a requirement
+    EarthLocation = None
+
+try:
+    from pyobs.comm.xmpp import XmppComm
+    from pyobs.utils.exceptions import RemoteError, RemoteTimeoutError
+except ImportError:  # the protocol layer below stays usable without pyobs
+    XmppComm = None
+    class RemoteError(Exception): pass
+    class RemoteTimeoutError(RemoteError): pass
+
+log = logging.getLogger("bridge")
+
+# ---------------------------------------------------------------------------
+# Stellarium wire protocol
+#
+# Little-endian throughout. Angles travel as scaled integers:
+#   RA  -- unsigned, 0x100000000 (2**32) spans a full turn (24h / 360 deg)
+#   Dec -- signed,   0x40000000  (2**30) spans 90 deg
+# ---------------------------------------------------------------------------
+
+RA_SCALE = 2**32 / 360.0
+DEC_SCALE = 2**30 / 90.0
+
+MSG_CURRENT_POSITION = 0  # bridge -> Stellarium
+MSG_GOTO = 0             # Stellarium -> bridge
+
+_POSITION = struct.Struct("<HHQIii")  # len, type, time_us, ra, dec, status
+_GOTO = struct.Struct("<HHQIi")       # len, type, time_us, ra, dec
+
+POSITION_SIZE = _POSITION.size  # 24
+GOTO_SIZE = _GOTO.size          # 20
+
+
+def ra_to_raw(ra_deg: float) -> int:
+    """Degrees (0-360, J2000) -> uint32. Wraps, so 360 and 0 agree."""
+    return round(ra_deg * RA_SCALE) % 2**32
+
+
+def raw_to_ra(raw: int) -> float:
+    """uint32 -> degrees in [0, 360)."""
+    return (raw % 2**32) / RA_SCALE
+
+
+def dec_to_raw(dec_deg: float) -> int:
+    """Degrees (-90..+90) -> int32. Clamped at the poles."""
+    return round(max(-90.0, min(90.0, dec_deg)) * DEC_SCALE)
+
+
+def raw_to_dec(raw: int) -> float:
+    """int32 -> degrees in [-90, +90]."""
+    return raw / DEC_SCALE
+
+
+def pack_position(ra_deg: float, dec_deg: float, timestamp_us: int | None = None,
+                  status: int = 0) -> bytes:
+    """Build the 24-byte position report Stellarium draws its reticle from."""
+    if timestamp_us is None:
+        timestamp_us = int(time.time() * 1_000_000)
+    return _POSITION.pack(POSITION_SIZE, MSG_CURRENT_POSITION, timestamp_us,
+                          ra_to_raw(ra_deg), dec_to_raw(dec_deg), status)
+
+
+def unpack_goto(data: bytes) -> tuple[float, float, int]:
+    """Parse a 20-byte goto request -> (ra_deg, dec_deg, timestamp_us)."""
+    if len(data) != GOTO_SIZE:
+        raise ValueError(f"goto message is {len(data)} bytes, expected {GOTO_SIZE}")
+    length, msg_type, timestamp_us, ra_raw, dec_raw = _GOTO.unpack(data)
+    if msg_type != MSG_GOTO:
+        raise ValueError(f"unexpected message type {msg_type}")
+    return raw_to_ra(ra_raw), raw_to_dec(dec_raw), timestamp_us
+
+
+# ---------------------------------------------------------------------------
+# pyobs access
+#
+# Deliberately knows nothing about Stellarium -- the planned Alpaca server
+# should be able to import this class as-is.
+# ---------------------------------------------------------------------------
+
+# Placeholders only -- the real values belong in config.yaml, which is not
+# committed. Nothing here should identify a particular machine or site.
+JID = "stellarium@localhost"
+PASSWORD = "pyobs"                 # pyobs's own documented example
+SERVER = "localhost:5222"
+TELESCOPE = "telescope"
+# Site of the telescope, used only to annotate logs with altitude.
+SITE_LAT, SITE_LON, SITE_ELEV = 0.0, 0.0, 0.0
+# Where we listen for Stellarium.
+HOST = "127.0.0.1"
+PORT = 10001
+# slewto.py's own account. It must differ from JID above: two logins on one
+# JID kick each other endlessly. Lives here so all settings share one file.
+SLEWTO_JID = "scratch@localhost"
+# scope.py needs its own again: running it alongside slewto.py on one JID
+# makes the two kick each other off in a loop.
+SCOPE_JID = "console@localhost"
+
+CONFIG_FILE = pathlib.Path(__file__).with_name("config.yaml")
+CONFIG_APPLIED: list[str] = []   # filled by load_config, reported once logging is up
+
+_CONFIG_KEYS = {
+    "pyobs": {"server": "SERVER", "jid": "JID", "password": "PASSWORD",
+              "module": "TELESCOPE"},
+    "site": {"latitude": "SITE_LAT", "longitude": "SITE_LON",
+             "elevation": "SITE_ELEV"},
+    "listen": {"host": "HOST", "port": "PORT"},
+    "slewto": {"jid": "SLEWTO_JID"},
+    "scope": {"jid": "SCOPE_JID"},
+}
+
+
+def load_config(path: pathlib.Path = CONFIG_FILE) -> None:
+    """Override the defaults above from config.yaml, if it is there.
+
+    Deliberately forgiving: a missing or unreadable file leaves the defaults
+    in place and says so. Being unable to read a config file is not a reason
+    to refuse to run. Unknown keys are warned about rather than ignored, so a
+    typo tells you instead of quietly doing nothing.
+    """
+    if not path.exists():
+        log.warning("config     no %s -- running on placeholder settings, which "
+                    "will not reach a real observatory. Copy "
+                    "config.example.yaml to %s.", path.name, path.name)
+        return
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text()) or {}
+    except Exception as err:
+        log.warning("config     could not read %s (%s); using defaults",
+                    path.name, err)
+        return
+    if not isinstance(data, dict):
+        log.warning("config     %s is not a mapping; using defaults", path.name)
+        return
+
+    applied = []
+    for section, values in data.items():
+        known = _CONFIG_KEYS.get(section)
+        if known is None:
+            log.warning("config     ignoring unknown section %r", section)
+            continue
+        if not isinstance(values, dict):
+            log.warning("config     section %r should be a mapping", section)
+            continue
+        for key, value in values.items():
+            name = known.get(key)
+            if name is None:
+                log.warning("config     ignoring unknown key %s.%s", section, key)
+                continue
+            globals()[name] = value
+            applied.append(f"{section}.{key}")
+    CONFIG_APPLIED.extend(applied)
+
+# Must run before anything below binds these as default arguments.
+load_config()
+
+RESOURCE = "pyobs"     # must match the modules: pyobs addresses peers as
+                       # <module>@<domain>/<own resource>, so changing this
+                       # makes every module invisible
+
+RECONNECT_DELAY = 3.0  # a module that raises drops XMPP and returns in ~2 s
+RETRIES = 3
+MAX_BACKOFF = 30.0    # ceiling on the reconnect backoff
+BAD_POLLS = 3         # consecutive failures before we rebuild the link
+OPEN_TIMEOUT = 20.0   # comm.open() hangs rather than raising if pyobs is away
+
+_RETRYABLE = (RemoteError, RemoteTimeoutError, asyncio.TimeoutError, TimeoutError)
+_TIMEOUTS = (RemoteTimeoutError, asyncio.TimeoutError, TimeoutError)
+
+SETTLED = {"idle", "tracking"}   # motion states that mean "not moving"
+SLEW_TIMEOUT = 300.0             # how long to watch a slew that outlived its RPC
+SETTLE_POLL = 2.0
+
+
+class PyobsTelescope:
+    """Thin async client for a pyobs telescope module, with patient retries."""
+
+    def __init__(self, jid: str = JID, password: str = PASSWORD,
+                 server: str = SERVER, module: str = TELESCOPE,
+                 resource: str = RESOURCE):
+        # Two logins sharing a JID kick each other in an endless loop, and
+        # the resource cannot be varied to dodge that (see RESOURCE), so a
+        # second instance needs its own registered account.
+        self._jid, self._password, self._server = jid, password, server
+        self._module, self._resource = module, resource
+        self._comm = None
+        self._proxy = None
+        self.connected = False
+        self.last_radec: tuple[float, float] | None = None
+        self._last_update = 0.0
+
+    async def _open(self) -> None:
+        if XmppComm is None:
+            raise RuntimeError("pyobs is not installed in this environment")
+        log.info("pyobs      connecting to %s as %s", self._server, self._jid)
+        self._comm = XmppComm(jid=self._jid, password=self._password,
+                              server=self._server, resource=self._resource)
+        try:
+            await asyncio.wait_for(self._comm.open(), OPEN_TIMEOUT)
+        except (asyncio.TimeoutError, Exception):
+            with contextlib.suppress(Exception):
+                await self._comm.close()
+            self._comm = None
+            raise
+        self.connected = True
+        log.info("pyobs      connected")
+
+    async def connect(self) -> None:
+        """Keep trying until pyobs answers -- the VM may not be up yet."""
+        delay = RECONNECT_DELAY
+        while True:
+            try:
+                await self._open()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                log.warning("pyobs      connect failed (%s); retrying in %.0f s",
+                            err or type(err).__name__, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, MAX_BACKOFF)
+
+    async def reconnect(self) -> None:
+        """Tear the link down and build a fresh one."""
+        log.warning("pyobs      link looks dead; reconnecting")
+        self.connected = False
+        try:
+            await self.close()
+        except Exception:
+            pass
+        await self.connect()
+
+    async def close(self) -> None:
+        if self._comm is not None:
+            await self._comm.close()
+            self._comm, self._proxy = None, None
+            self.connected = False
+            log.info("pyobs      link closed")
+
+    @property
+    def position_age(self) -> float:
+        """Seconds since the position was last read for real."""
+        if self._last_update == 0.0:
+            return float("inf")
+        return time.monotonic() - self._last_update
+
+    @property
+    def module_visible(self) -> bool:
+        """Is the telescope module actually announcing itself right now?"""
+        try:
+            return self._comm is not None and self._module in self._comm.clients
+        except Exception:
+            return False
+
+    async def _get_proxy(self):
+        if self._proxy is None:
+            self._proxy = await self._comm.proxy(self._module)
+        return self._proxy
+
+    async def _call(self, method: str, *args, retry_timeouts: bool = True):
+        """Invoke a remote method, riding out the reconnect wart.
+
+        retry_timeouts=False for calls where a timeout does not mean failure --
+        re-sending them would be actively harmful.
+        """
+        for attempt in range(1, RETRIES + 1):
+            try:
+                proxy = await self._get_proxy()
+                return await getattr(proxy, method)(*args)
+            except _RETRYABLE as err:
+                if not retry_timeouts and isinstance(err, _TIMEOUTS):
+                    raise
+                self._proxy = None  # module is reconnecting; re-resolve it
+                if attempt == RETRIES:
+                    log.error("%s failed after %d attempts: %s", method, RETRIES, err)
+                    raise
+                log.warning("%s failed (%s), retry %d/%d in %.0f s",
+                            method, type(err).__name__, attempt, RETRIES,
+                            RECONNECT_DELAY)
+                await asyncio.sleep(RECONNECT_DELAY)
+
+    async def get_radec(self) -> tuple[float, float]:
+        """Current pointing in degrees, J2000. Caches the result."""
+        ra, dec = await self._call("get_radec")
+        self.last_radec = (float(ra), float(dec))
+        self._last_update = time.monotonic()
+        return self.last_radec
+
+    async def wait_until_settled(self, timeout: float = SLEW_TIMEOUT) -> bool:
+        """Poll motion status until the mount stops moving."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                status = await self.get_motion_status()
+            except Exception as err:
+                log.warning("pyobs      could not read motion status: %s", err)
+                status = None
+            if status in SETTLED:
+                log.info("pyobs      mount settled (%s)", status)
+                return True
+            await asyncio.sleep(SETTLE_POLL)
+        log.warning("pyobs      mount still moving after %.0f s", timeout)
+        return False
+
+    async def move_radec(self, ra_deg: float, dec_deg: float) -> None:
+        """Slew. Raises remotely if the target is below the altitude limit.
+
+        move_radec blocks for the whole move, and pyobs times an RPC out at
+        ~30 s. The sim slews in seconds so this never shows there, but a real
+        mount can easily take longer -- and re-sending the command to a mount
+        that is already moving is worse than waiting. So on a timeout, watch
+        the motion status instead of retrying.
+        """
+        log.info("pyobs      slewing to RA %.4f Dec %.4f", ra_deg, dec_deg)
+        try:
+            await self._call("move_radec", ra_deg, dec_deg, retry_timeouts=False)
+        except _TIMEOUTS:
+            log.info("move_radec RPC timed out; the slew is probably still "
+                     "running, watching motion status")
+            await self.wait_until_settled()
+
+    async def get_motion_status(self) -> str:
+        """Lowercase status string, e.g. 'idle' / 'slewing'."""
+        return str(await self._call("get_motion_status")).lower()
+
+# ---------------------------------------------------------------------------
+# Stellarium TCP server
+#
+# Stellarium is the client; we listen. One background poller keeps a fresh
+# position so a slow or sulking XMPP call never stalls the reticle.
+# ---------------------------------------------------------------------------
+
+POLL_INTERVAL = 1.0
+MODULE_WAIT = 5.0     # gentler cadence while the module is away
+STALE_AFTER = 10.0    # past this, stop showing a position we cannot vouch for
+MOVED_THRESHOLD = 0.01   # degrees of change that counts as the mount moving
+
+
+def altitude_of(ra_deg: float, dec_deg: float) -> float | None:
+    """Altitude of that position right now, or None without astropy."""
+    if EarthLocation is None:
+        return None
+    site = EarthLocation(lat=SITE_LAT * u.deg, lon=SITE_LON * u.deg,
+                         height=SITE_ELEV * u.m)
+    frame = AltAz(obstime=Time.now(), location=site)
+    return SkyCoord(ra_deg * u.deg, dec_deg * u.deg).transform_to(frame).alt.degree
+
+def _position_note(pos: tuple[float, float]) -> str:
+    alt = altitude_of(*pos)
+    where = f"RA {pos[0]:.4f} Dec {pos[1]:+.4f}"
+    return where if alt is None else f"{where}, {alt:.0f} deg up"
+
+
+class StellariumBridge:
+    def __init__(self, telescope: PyobsTelescope, host: str = HOST, port: int = PORT):
+        self._tel = telescope
+        self._host, self._port = host, port
+        self._clients: set[asyncio.StreamWriter] = set()
+        self._tasks: set[asyncio.Task] = set()
+        self._pending: tuple[float, float] | None = None   # newest requested target
+        self._in_flight: tuple[float, float] | None = None
+        self._slewer: asyncio.Task | None = None
+        self._stale_dropped = False
+        self._last_pos: tuple[float, float] | None = None
+        self._last_status: str | None = None
+
+    def _spawn(self, coro) -> None:
+        """Track every task so a client hangup can't leak one."""
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _poll_forever(self) -> None:
+        """Refresh the cached position ~1 Hz.
+
+        pyobs can vanish under us -- the VM reboots, the sim gets restarted --
+        so a run of failures rebuilds the link rather than killing the bridge.
+        Stellarium keeps its reticle on the last known position meanwhile.
+        """
+        await self._tel.connect()
+        misses = 0
+        waiting = False
+        while True:
+            try:
+                await self._tel.get_radec()
+                if waiting:
+                    log.info("pyobs      telescope module is back")
+                if self._stale_dropped:
+                    log.info("client     position is fresh again; clients may reconnect")
+                    self._stale_dropped = False
+                misses, waiting = 0, False
+                await self._note_motion()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                if not self._tel.module_visible:
+                    # The link is fine, the module simply is not there --
+                    # rebuilding the link would only thrash, so just wait.
+                    if not waiting:
+                        log.warning("pyobs      telescope module not present; waiting for it")
+                        waiting = True
+                    misses = 0
+                    await asyncio.sleep(MODULE_WAIT)
+                    continue
+                misses += 1
+                log.warning("pyobs      position poll failed (%d/%d): %s",
+                            misses, BAD_POLLS, err)
+                if misses >= BAD_POLLS:
+                    misses = 0
+                    try:
+                        await self._tel.reconnect()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as err2:
+                        log.error("pyobs      reconnect attempt failed: %s", err2)
+            await asyncio.sleep(POLL_INTERVAL)
+
+    async def _note_motion(self) -> None:
+        """Log state changes even when someone else moved the telescope.
+
+        Costs an extra RPC only while something is happening: once the mount
+        is settled and the position stops changing, we stop asking.
+        """
+        pos = self._tel.last_radec
+        if pos is None:
+            return
+        moved = self._last_pos is None or max(
+            abs(pos[0] - self._last_pos[0]), abs(pos[1] - self._last_pos[1])
+        ) > MOVED_THRESHOLD
+        self._last_pos = pos
+        if not moved and self._last_status not in (None, "slewing"):
+            return
+        try:
+            status = await self._tel.get_motion_status()
+        except Exception:
+            return
+        if status != self._last_status:
+            if status in SETTLED:
+                # Includes the very first reading: on startup this line is the
+                # whole picture of where things stand.
+                log.info("pyobs      telescope %s -- %s", status, _position_note(pos))
+            else:
+                log.info("pyobs      telescope %s", status)   # mid-slew: position is moving
+            self._last_status = status
+        elif moved and status in SETTLED:
+            log.info("pyobs      telescope moved -- %s", _position_note(pos))
+
+    @property
+    def _stale(self) -> bool:
+        """Is the cached position too old to put in front of someone?
+
+        Short blips ride through on the last known position; past STALE_AFTER
+        we hang up instead, so Stellarium shows Disconnected rather than a
+        confident reticle pointing at where the telescope used to be.
+        """
+        return self._tel.position_age > STALE_AFTER
+
+    async def _send_forever(self, writer: asyncio.StreamWriter) -> None:
+        """Feed one client the cached position until it goes away."""
+        while True:
+            if self._stale:
+                if not self._stale_dropped:
+                    log.warning("client     position %.0f s old; hanging up rather "
+                                "than showing a stale reticle",
+                                self._tel.position_age)
+                    self._stale_dropped = True
+                writer.close()
+                return
+            if self._tel.last_radec is not None:
+                ra, dec = self._tel.last_radec
+                writer.write(pack_position(ra, dec))
+                await writer.drain()
+            await asyncio.sleep(POLL_INTERVAL)
+
+    def _request_slew(self, ra_deg: float, dec_deg: float) -> None:
+        """Queue a target. Holding the slew key repeats it dozens of times a
+        second, and firing a move_radec per packet makes them fight over the
+        telescope's motion lock, so collapse repeats and keep one slew going."""
+        target = (ra_deg, dec_deg)
+        if target in (self._in_flight, self._pending):
+            log.debug("client     ignoring repeat goto RA %.4f Dec %.4f", ra_deg, dec_deg)
+            return
+        log.info("client     goto request: RA %.4f Dec %.4f", ra_deg, dec_deg)
+        self._pending = target
+        if self._slewer is None or self._slewer.done():
+            self._slewer = asyncio.create_task(self._slew_worker())
+            self._tasks.add(self._slewer)
+            self._slewer.add_done_callback(self._tasks.discard)
+
+    async def _slew_worker(self) -> None:
+        """Serialise slews; a burst of gotos collapses to the newest target."""
+        while self._pending is not None:
+            self._in_flight, self._pending = self._pending, None
+            ra_deg, dec_deg = self._in_flight
+            try:
+                await self._tel.move_radec(ra_deg, dec_deg)
+                log.info("pyobs      slew finished")
+            except Exception as err:
+                log.error("pyobs      slew to RA %.4f Dec %.4f failed: %s", ra_deg, dec_deg, err)
+        self._in_flight = None
+
+    async def _handle(self, reader: asyncio.StreamReader,
+                      writer: asyncio.StreamWriter) -> None:
+        if self._stale:
+            writer.close()      # nothing worth showing; do not log the churn
+            return
+        log.info("client     connected (%d connected)", len(self._clients) + 1)
+        self._clients.add(writer)
+        sender = asyncio.create_task(self._send_forever(writer))
+        try:
+            while True:
+                header = await reader.readexactly(2)
+                length = struct.unpack("<H", header)[0]
+                if length < 2:
+                    log.warning("client     bogus message length %d, dropping it", length)
+                    break
+                message = header + await reader.readexactly(length - 2)
+                if length == GOTO_SIZE:
+                    ra, dec, _ = unpack_goto(message)
+                    self._request_slew(ra, dec)
+                else:
+                    log.debug("client     ignoring %d-byte message", length)
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass                      # a client hanging up is not an error
+        except Exception as err:
+            log.error("client     error: %s", err)
+        finally:
+            sender.cancel()  # no orphaned senders across reconnects
+            self._clients.discard(writer)
+            # after the discard, so the count is what is actually left
+            log.info("client     gone (%d connected)", len(self._clients))
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def run(self) -> None:
+        # The listener comes up first: Stellarium can connect and sit there
+        # quite happily while we are still chasing the telescope.
+        poller = asyncio.create_task(self._poll_forever())
+        server = await asyncio.start_server(self._handle, self._host, self._port)
+        log.info("client     listening on %s:%d -- point Stellarium here",
+                 self._host, self._port)
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            poller.cancel()
+            for task in list(self._tasks):
+                task.cancel()
+            await self._tel.close()
+
+async def main() -> None:
+    bridge = StellariumBridge(PyobsTelescope())
+    try:
+        await bridge.run()
+    except asyncio.CancelledError:
+        pass
+
+class _DropSlixmppHandleError(logging.Filter):
+    """slixmpp's XEP_0009 calls a handle_error() it does not define, so an
+    error IQ from a module makes the library throw while logging the error.
+    Two tracebacks, no consequence -- our retry catches the RemoteError."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "handle_error" not in record.getMessage() and not (
+            record.exc_info and "handle_error" in str(record.exc_info[1]))
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)-7s %(message)s",
+                        datefmt="%H:%M:%S")
+    # Must sit on the handler: records from child loggers propagate straight
+    # to ancestor handlers and never see an ancestor logger's filters.
+    for _handler in logging.getLogger().handlers:
+        _handler.addFilter(_DropSlixmppHandleError())
+    if CONFIG_APPLIED:
+        log.info("config     %s: %s", CONFIG_FILE.name, ", ".join(CONFIG_APPLIED))
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("shutting down")
