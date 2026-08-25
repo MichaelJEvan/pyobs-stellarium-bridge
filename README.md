@@ -39,8 +39,10 @@ broadcast underneath, the cache is always current and the polling client gets
 fresh data whenever it asks.
 
 An ASCOM Alpaca server, so SkyChart / Cartes du Ciel 4.2+ can connect
-natively. Alpaca is a REST protocol that SkyChart already speaks, so no bridge
-would be needed on that side — the server would expose the same pyobs
+natively. Not to be confused with pyobs-alpaca, which is the opposite direction,
+that lets pyobs drive Alpaca hardware. This would expose a pyobs telescope as an Alpaca
+device, so other software can drive it. Alpaca is a REST protocol that SkyChart already 
+speaks, so no bridge would be needed on that side — the server would expose the same pyobs
 telescope over HTTP instead of Stellarium's binary protocol, reusing the
 `PyobsTelescope` class this suite is built on. Anything else speaking Alpaca —
 NINA, KStars, SkySafari — would work too.
