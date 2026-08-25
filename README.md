@@ -10,6 +10,9 @@ A Python suite that connects a pyobs observatory to Stellarium. The telescope
 can be driven from Stellarium, from the terminal, or by pyobs itself — any
 telescope control commands can be observed in real-time from Stellarium.
 
+<img width="1832" height="1448" alt="Stellarium_tracking" src="https://github.com/user-attachments/assets/ac605a5b-2a0e-44a9-a91c-19c8c8304481" />
+<img width="1832" height="1447" alt="pyobs_bridge_suite" src="https://github.com/user-attachments/assets/e508862b-86bb-4805-9e6f-1f6cb8a5d3b1" />
+
 The suite was developed by integrating a control bridge (`bridge.py`) to the
 pyobs observatory control program / simulator, which reports the pyobs
 telescope's position in Stellarium once per second, providing a visual
