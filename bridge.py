@@ -377,6 +377,8 @@ POLL_INTERVAL = 1.0
 MODULE_WAIT = 5.0     # gentler cadence while the module is away
 STALE_AFTER = 10.0    # past this, stop showing a position we cannot vouch for
 MOVED_THRESHOLD = 0.01   # degrees of change that counts as the mount moving
+HORIZON = 0.0            # degrees: below this the mount points into the ground
+HORIZON_POLL = 30.0      # seconds between altitude checks; the sky moves 0.25 deg/min
 
 
 def altitude_of(ra_deg: float, dec_deg: float) -> float | None:
@@ -406,6 +408,8 @@ class StellariumBridge:
         self._stale_dropped = False
         self._last_pos: tuple[float, float] | None = None
         self._last_status: str | None = None
+        self._below_horizon: bool | None = None   # None until the first check
+        self._horizon_checked = 0.0
 
     def _spawn(self, coro) -> None:
         """Track every task so a client hangup can't leak one."""
@@ -433,6 +437,7 @@ class StellariumBridge:
                     self._stale_dropped = False
                 misses, waiting = 0, False
                 await self._note_motion()
+                self._note_horizon()
             except asyncio.CancelledError:
                 raise
             except Exception as err:
@@ -487,6 +492,41 @@ class StellariumBridge:
             self._last_status = status
         elif moved and status in SETTLED:
             log.info("pyobs      telescope moved -- %s", _position_note(pos))
+
+    def _note_horizon(self) -> None:
+        """Warn when the telescope is left pointing below the horizon.
+
+        pyobs checks its altitude limit only at the moment it accepts a slew
+        (BaseTelescope.move_radec); nothing re-checks it afterwards. A mount
+        tracking a setting target therefore follows it straight down through
+        the horizon and goes on reporting "tracking" from underground. We
+        watch and say so -- this is a monitoring bridge, not an interlock --
+        but the log should not stay silent about it all night.
+
+        Edge-triggered: one line at each crossing, not one a second.
+        """
+        pos = self._tel.last_radec
+        if pos is None:
+            return
+        now = time.monotonic()
+        if now - self._horizon_checked < HORIZON_POLL:
+            return
+        self._horizon_checked = now
+        alt = altitude_of(*pos)
+        if alt is None:          # no astropy: nothing to measure against
+            return
+        below = alt < HORIZON
+        if below == self._below_horizon:
+            return
+        first = self._below_horizon is None
+        self._below_horizon = below
+        if below:
+            log.warning("horizon    telescope is %.0f deg below the horizon "
+                        "(%s); pyobs will not stop it", -alt,
+                        self._last_status or "motion status unknown")
+        elif not first:
+            log.info("horizon    telescope is back above the horizon "
+                     "(%.0f deg up)", alt)
 
     @property
     def _stale(self) -> bool:
