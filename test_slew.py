@@ -113,6 +113,82 @@ def test_other_errors_still_retry():
         f"retried {len(proxy.moves)} times, want {bridge.RETRIES}"
 
 
+class SlowProxy(FakeProxy):
+    """A mount that never finishes, standing in for one whose module died."""
+
+    async def move_radec(self, ra, dec):
+        self.moves.append((ra, dec))
+        await asyncio.sleep(3600)
+
+
+def test_losing_the_module_abandons_the_slew_at_once():
+    """Do not wait out a timeout for an answer that is not coming.
+
+    pyobs gives move_radec twenty minutes, which is what a professional mount
+    might genuinely need. It is useless to somebody standing next to a moving
+    telescope: if the module has gone, nothing can command that mount, and the
+    operator needs to know now rather than after lunch. Measured 2026-08-27 --
+    scope.py sat at "slewing to vega..." for ten minutes after the module was
+    killed, while the bridge had reported it gone within seconds.
+    """
+    async def run():
+        proxy = SlowProxy()
+        tel = _telescope(proxy)
+        tel.last_radec = (123.0, 45.0)
+        slew = asyncio.create_task(tel.move_radec(10.0, 20.0))
+        await asyncio.sleep(0.05)                      # let it get going
+        assert not slew.done(), "should still be waiting on the mount"
+        # The module goes, exactly as the comm would tell us.
+        await tel._module_changed(bridge.ModuleClosedEvent(), "telescope")
+        try:
+            await asyncio.wait_for(slew, timeout=1.0)
+        except asyncio.TimeoutError:
+            raise AssertionError("still waiting a second after the module went")
+        except bridge.TelescopeLost as err:
+            return str(err)
+        raise AssertionError("returned normally instead of reporting the loss")
+
+    message = asyncio.run(run())
+    assert "lost contact" in message, message
+    assert "RA 123.0000" in message, \
+        f"should say where it was when contact went: {message}"
+
+
+def test_losing_the_module_is_not_reported_as_a_timeout():
+    """A timeout and a dead module deserve different words.
+
+    "Timed out" means it is probably still slewing. "Lost contact" means
+    nothing can command the mount at all. Conflating them would tell an
+    operator to keep waiting when they should be walking outside.
+    """
+    async def run():
+        proxy = SlowProxy()
+        tel = _telescope(proxy)
+        slew = asyncio.create_task(tel.move_radec(1.0, 2.0))
+        await asyncio.sleep(0.05)
+        await tel._module_changed(bridge.ModuleClosedEvent(), "telescope")
+        try:
+            await slew
+        except bridge.TelescopeLost:
+            return "lost"
+        except Exception as err:
+            return type(err).__name__
+        return "no error"
+
+    assert asyncio.run(run()) == "lost", "a dead module must not look like a timeout"
+
+
+def test_a_settle_watch_gives_up_when_the_module_goes():
+    """wait_until_settled must not poll a module that is not there."""
+    async def run():
+        proxy = FakeProxy(statuses=["slewing"])
+        tel = _telescope(proxy)
+        tel._module_lost.set()
+        return await tel.wait_until_settled(timeout=5.0)
+
+    assert asyncio.run(run()) is False
+
+
 if __name__ == "__main__":
     bridge.SETTLE_POLL = 0.01      # keep the suite quick
     bridge.RECONNECT_DELAY = 0.01

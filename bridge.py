@@ -227,6 +227,16 @@ STATE_WAIT = 15.0     # how long to wait for a first value after subscribing.
                       # Freshness is judged from the value's own timestamp
                       # instead -- see position_age.
 
+class TelescopeLost(Exception):
+    """Contact with the telescope module was lost while we were waiting on it.
+
+    Distinct from a timeout on purpose. A timeout means "no answer yet, it is
+    probably still working"; this means "the module is gone, no answer is
+    coming, and nothing can command the mount until it returns". Those deserve
+    different words in front of an operator.
+    """
+
+
 _RETRYABLE = (RemoteError, RemoteTimeoutError, asyncio.TimeoutError, TimeoutError)
 _TIMEOUTS = (RemoteTimeoutError, asyncio.TimeoutError, TimeoutError)
 
@@ -250,6 +260,7 @@ class PyobsTelescope:
         self._proxy = None
         self._stack: contextlib.AsyncExitStack | None = None
         self._proxy_stale = False        # set by the module-event handler below
+        self._module_lost = asyncio.Event()   # set the moment the module goes
         self.connected = False
         self.position_is_fresh = False   # was the last position actually published
                                          # recently, or is it the last thing we heard?
@@ -312,6 +323,14 @@ class PyobsTelescope:
             log.info("pyobs      telescope module %s; the proxy is stale",
                      "went away" if going else "reappeared")
             self._proxy_stale = True
+            # Anything blocked waiting on the module is waiting for an answer
+            # that is no longer coming. Say so now rather than sitting quiet
+            # until a timeout: pyobs gives move_radec twenty minutes, which is
+            # useless to somebody standing next to a moving telescope.
+            if going:
+                self._module_lost.set()
+            else:
+                self._module_lost.clear()
         return True
 
     async def connect(self) -> None:
@@ -490,6 +509,10 @@ class PyobsTelescope:
         """Poll motion status until the mount stops moving."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if self._module_lost.is_set():
+                log.warning("pyobs      gave up watching the mount: the module "
+                            "is gone")
+                return False
             try:
                 status = await self.get_motion_status()
             except Exception as err:
@@ -512,16 +535,37 @@ class PyobsTelescope:
         the motion status instead of retrying.
         """
         log.info("pyobs      slewing to RA %.4f Dec %.4f", ra_deg, dec_deg)
-        try:
-            async def go(proxy):
-                return await proxy.move_radec(ra_deg, dec_deg)
 
-            await self._with_proxy(IPointingRaDec, "move_radec", go,
-                                   retry_timeouts=False)
+        async def go(proxy):
+            return await proxy.move_radec(ra_deg, dec_deg)
+
+        self._module_lost.clear()
+        slew = asyncio.ensure_future(
+            self._with_proxy(IPointingRaDec, "move_radec", go,
+                             retry_timeouts=False))
+        lost = asyncio.ensure_future(self._module_lost.wait())
+        try:
+            done, _ = await asyncio.wait({slew, lost},
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if lost in done:
+                # The module vanished. Do not fall through to watching motion
+                # status -- there is nothing left to ask.
+                where = ("last seen at RA %.4f Dec %.4f" % self.last_radec
+                         if self.last_radec else "position unknown")
+                raise TelescopeLost(
+                    f"lost contact with the telescope during the slew; {where}. "
+                    "The mount will carry on doing whatever it was last told.")
+            await slew          # completed or raised on its own
         except _TIMEOUTS:
             log.info("move_radec RPC timed out; the slew is probably still "
                      "running, watching motion status")
             await self.wait_until_settled()
+        finally:
+            for task in (slew, lost):
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await task
 
     async def get_motion_status(self) -> str:
         """Lowercase status string, e.g. 'idle' / 'slewing'.

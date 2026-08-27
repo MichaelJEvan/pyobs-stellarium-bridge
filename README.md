@@ -51,7 +51,7 @@ NINA, KStars, SkySafari — would work too.
 | `nightwatch.py` | Live terminal readout of where the telescope is pointing, read from the bridge. |
 | `slewto.py` | Command-line slewing, by name or coordinates. |
 | `scope.py` | Interactive console — slew, home, park, abort, all from one prompt. |
-| `test_*.py` | Seven test files, 44 tests. None need pyobs or Stellarium. |
+| `test_*.py` | Seven test files, 47 tests. None need pyobs or Stellarium. |
 | `config.yaml` | Your settings — gitignored, copied from the example. |
 | `config.example.yaml` | The template, with placeholders. |
 
@@ -212,13 +212,13 @@ Stellarium, shut the laptop: the mount carries on.
 python test_protocol.py    # RA/Dec scaling and packing, 10 tests
 python test_scope.py       # stopping the telescope honestly, 10 tests
 python test_horizon.py     # warning when the mount points into the ground, 6
-python test_slew.py        # slew retry behaviour, 4 tests
+python test_slew.py        # slew retries, and giving up when the module dies, 7
 python test_motion.py      # logs motion whoever commanded it, 5
 python test_proxy.py       # a proxy must not outlive its module, 6
 python test_stale.py       # hangs up rather than showing a stale reticle, 3
 ```
 
-Forty-four tests, all cold in about a second — nothing else needs to be running.
+Forty-seven tests, all cold in about a second — nothing else needs to be running.
 
 ## Behaviour worth knowing
 
@@ -263,6 +263,15 @@ an empty method there, so a simulated slew could not be stopped; `scope.py`
 tries, fails, and says so rather than claiming success. pyobs 2.0 implements it, and it works: aborting a slew mid-flight stops the
 mount partway and reports the status it actually settled into. Verified on the
 2.0 simulator — not on real hardware.
+
+**Losing the telescope mid-slew is reported at once.** pyobs gives
+`move_radec` twenty minutes before it times out, which suits a professional
+mount that might really take that long. If the module dies, though, that is
+twenty minutes of silence while nothing can command the mount at all. The
+suite listens for the module going away and abandons the wait within seconds,
+saying where the telescope was when contact went. It is not an interlock:
+nothing in software can stop a mount whose control module has died. What stops
+it is the mount's own limits and a power cutoff you can reach.
 
 **A parked telescope ignores slews silently.** pyobs returns from
 `move_radec` without moving and without complaining when the mount is parked,
