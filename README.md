@@ -10,6 +10,8 @@ A Python suite that connects a pyobs observatory to Stellarium. The telescope
 can be driven from Stellarium, from the terminal, or by pyobs itself — any
 telescope control commands can be observed in real-time from Stellarium.
 
+**Runs against pyobs-core 2.0.** Developed and verified on 2.0.1.
+
 <img width="1832" height="1448" alt="Stellarium_tracking" src="https://github.com/user-attachments/assets/ac605a5b-2a0e-44a9-a91c-19c8c8304481" />
 <img width="1832" height="1447" alt="pyobs_bridge_suite" src="https://github.com/user-attachments/assets/e508862b-86bb-4805-9e6f-1f6cb8a5d3b1" />
 
@@ -32,12 +34,6 @@ park, abort and init from one prompt, staying connected between commands.
 
 **Future Release:**
 
-Integration with pyobs 2.0, which broadcasts its state instead of answering
-polls. Currently the bridge polls pyobs and pushes to Stellarium at 1 Hz — two
-clocks that don't line up, which is where the slight lag comes from. With a
-broadcast underneath, the cache is always current and the polling client gets
-fresh data whenever it asks.
-
 An ASCOM Alpaca server, so SkyChart / Cartes du Ciel 4.2+ can connect
 natively. Not to be confused with pyobs-alpaca, which is the opposite direction,
 that lets pyobs drive Alpaca hardware. This would expose a pyobs telescope as an Alpaca
@@ -55,7 +51,7 @@ NINA, KStars, SkySafari — would work too.
 | `nightwatch.py` | Live terminal readout of where the telescope is pointing, read from the bridge. |
 | `slewto.py` | Command-line slewing, by name or coordinates. |
 | `scope.py` | Interactive console — slew, home, park, abort, all from one prompt. |
-| `test_*.py` | Five test files, 31 tests. None need pyobs or Stellarium. |
+| `test_*.py` | Seven test files, 40 tests. None need pyobs or Stellarium. |
 | `config.yaml` | Your settings — gitignored, copied from the example. |
 | `config.example.yaml` | The template, with placeholders. |
 
@@ -66,10 +62,19 @@ Linux VM hosted by a thoroughly unremarkable old-n-dusty HP. None of that matter
 Stellarium runs on Mac, Windows and Linux, pyobs needs to be somewhere
 reachable over the network, or the two can be on the same machine.*
 
-**Tested against pyobs-core 1.54.4.** pyobs 2.0 changes how modules report
-their position — the getter methods this relies on are replaced by published
-state — so this will need work once 2.0.0 is released. It is not expected to
-run against 2.0 as it stands.
+**Tested against pyobs-core 2.0.1.** pyobs 2.0 replaced the getter methods
+this used to call — `get_radec` and `get_motion_status` — with state published
+over XMPP, so `PyobsTelescope` was rewritten around a held subscription.
+Everything above it was untouched: the wire protocol, the TCP server, and the
+other three programs needed no changes at all.
+
+Two things worth knowing before you pin a version. pyobs 2.0 is still an
+actively moving line — its own release notes describe 2.0.x as under
+development until a final 2.0 — so expect it to shift. And **both ends must be
+on the same version**: a 1.54 client cannot talk to a 2.0 module, and there is
+no promise that distant 2.0.x releases always will either.
+
+The last version that talks to pyobs 1.54 is tagged `v1.54-final`.
 
 **Prerequisite: a working pyobs installation**, with its XMPP server running.
 Installing and configuring pyobs is out of scope here — see the pyobs
@@ -187,11 +192,16 @@ format.
    └── Stellarium    connects to localhost:10001
 ```
 
-The bridge polls the telescope's position once a second and pushes it to
-Stellarium as a 24-byte packet. Stellarium's slew commands arrive as 20-byte
-packets going the other way. Anything that moves the telescope — Stellarium,
-`slewto.py`, the pyobs scheduler, the GUI — shows up in the reticle, because
-the bridge reports position rather than tracking commands.
+The bridge reads the telescope's published position once a second and pushes
+it to Stellarium as a 24-byte packet. Under pyobs 2.0 nothing is asked of the
+telescope module — it broadcasts `RaDecState` and `MotionState`, and the
+bridge holds a subscription and reads the current value locally. A busy or
+sulking module cannot stall the reticle.
+
+Stellarium's slew commands arrive as 20-byte packets going the other way.
+Anything that moves the telescope — Stellarium, `slewto.py`, the pyobs
+scheduler, the GUI — shows up in the reticle, because the bridge reports
+position rather than tracking commands.
 
 The observatory does not depend on any of this. Kill the bridge, close
 Stellarium, shut the laptop: the mount carries on.
@@ -200,13 +210,15 @@ Stellarium, shut the laptop: the mount carries on.
 
 ```bash
 python test_protocol.py    # RA/Dec scaling and packing, 10 tests
-python test_slew.py        # slew retry behaviour, 4 tests
-python test_stale.py       # hangs up rather than showing a stale reticle, 3
-python test_motion.py      # logs motion whoever commanded it, 4
 python test_scope.py       # stopping the telescope honestly, 10 tests
+python test_horizon.py     # warning when the mount points into the ground, 6
+python test_slew.py        # slew retry behaviour, 4 tests
+python test_motion.py      # logs motion whoever commanded it, 4
+python test_proxy.py       # a proxy must not outlive its module, 3
+python test_stale.py       # hangs up rather than showing a stale reticle, 3
 ```
 
-All run cold in about a second — nothing else needs to be running.
+Forty tests, all cold in about a second — nothing else needs to be running.
 
 ## Behaviour worth knowing
 
@@ -219,6 +231,13 @@ Stellarium reconnects by itself once the position is fresh again.
 of times a second. The bridge collapses repeats and runs one slew at a time;
 without that, pyobs raises `AcquireLockFailed` in a cascade and has to be
 restarted.
+
+**Below the horizon.** pyobs checks its altitude limit once, when it accepts a
+slew, and nothing re-checks it afterwards. A mount tracking a setting target
+therefore follows it straight down through the horizon and goes on reporting
+`tracking` from underground — measured overnight at 13 hours, from 65° up to
+24° below. The bridge logs one line at each crossing, down and up. It only
+warns: this is a monitoring bridge, not an interlock.
 
 **Altitude.** pyobs refuses targets below 10°, checked against **real
 wall-clock time** — not the faked time in `telcam.yaml`, which only drives the
@@ -239,10 +258,11 @@ either; it carries on making decisions.
 
 **Drive from one or the other, never both.** Watch from anywhere you like.
 
-**Abort does nothing on the 1.54 simulator.** `DummyTelescope.stop_motion` is
-an empty method, so a simulated slew cannot be stopped. `scope.py` tries,
-fails, and says so rather than claiming success. pyobs 2.0 implements it, and
-real telescope drivers do too — this is a simulator limitation, not a bug.
+**Abort was a no-op on the 1.54 simulator.** `DummyTelescope.stop_motion` was
+an empty method there, so a simulated slew could not be stopped; `scope.py`
+tries, fails, and says so rather than claiming success. pyobs 2.0 implements
+it — but that path has not been exercised here yet, on the simulator or on
+real hardware.
 
 **A parked telescope ignores slews silently.** pyobs returns from
 `move_radec` without moving and without complaining when the mount is parked,
@@ -266,8 +286,8 @@ for t in test_*.py; do python "$t"; done
 ```
 
 **Debugging.** The useful breakpoints are in `StellariumBridge._handle`, where
-packets arrive, and `PyobsTelescope._call`, where every remote call goes
-through.
+packets arrive, and `PyobsTelescope._with_proxy`, where every call to pyobs
+goes through.
 
 **Where things live.** `bridge.py` is in three parts: the Stellarium wire
 protocol, `PyobsTelescope` (which knows nothing about Stellarium and is meant
