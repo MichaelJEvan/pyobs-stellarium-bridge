@@ -128,6 +128,55 @@ def test_an_event_about_another_module_is_ignored():
     assert second is first, "another module's event must not disturb our proxy"
 
 
+def test_an_event_arriving_during_resolution_is_not_lost():
+    """The stale flag must be taken before we await, not cleared after.
+
+    A module coming back is exactly when ModuleOpenedEvent fires, and it is
+    also exactly when we are likely to be resolving a proxy. Clearing the
+    flag after the await swallows that event, leaving us holding a proxy
+    resolved a moment too early with no record that it needs replacing.
+    """
+    class CommThatFiresMidResolve(FakeComm):
+        """Delivers a module event while a proxy is being resolved."""
+        def __init__(self):
+            super().__init__()
+            self.tel = None
+            self.fire_next = False
+
+        def proxy(self, _name, _interface=None):
+            comm = self
+
+            class _Ctx:
+                async def __aenter__(self):
+                    if comm.fire_next:
+                        comm.fire_next = False
+                        await comm.tel._module_changed(
+                            bridge.ModuleOpenedEvent(), "telescope")
+                    proxy = FakeProxy(f"proxy{len(comm.handed_out)}")
+                    comm.handed_out.append(proxy)
+                    return proxy
+
+                async def __aexit__(self, *_exc):
+                    return False
+
+            return _Ctx()
+
+    async def run():
+        tel = PyobsTelescope()
+        tel._comm = CommThatFiresMidResolve()
+        tel._comm.tel = tel
+        await tel._get_proxy()
+        tel._comm.fire_next = True          # event lands during the next resolve
+        tel._proxy_stale = True
+        second = await tel._get_proxy()
+        third = await tel._get_proxy()      # must act on the event it received
+        return second, third
+
+    second, third = asyncio.run(run())
+    assert third is not second, \
+        "an event arriving while resolving was swallowed instead of honoured"
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:

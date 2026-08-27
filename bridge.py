@@ -382,7 +382,11 @@ class PyobsTelescope:
         populated three seconds later. AsyncExitStack is what the upgrade notes
         recommend for a proxy that has to outlive one `async with` block.
         """
-        if self._proxy is not None and (self._proxy_stale or not self.module_visible):
+        # Take the flag before doing anything that awaits. An event arriving
+        # while we are resolving would otherwise be cleared below and lost --
+        # and a module coming back is exactly when that event fires.
+        stale, self._proxy_stale = self._proxy_stale, False
+        if self._proxy is not None and (stale or not self.module_visible):
             # The module went away. Its subscription went with it, but the
             # proxy keeps handing back the last value it ever received -- so a
             # caller sees a frozen position and never learns it is frozen.
@@ -395,7 +399,6 @@ class PyobsTelescope:
             await self._stack.__aenter__()
             self._proxy = await self._stack.enter_async_context(
                 self._comm.proxy(self._module))
-            self._proxy_stale = False
         return self._proxy
 
     async def _release_proxy(self) -> None:
