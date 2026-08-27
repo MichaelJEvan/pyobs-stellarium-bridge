@@ -49,14 +49,36 @@ def test_first_poll_reports_the_full_picture():
     assert "deg up" in line, line
 
 
-def test_idle_mount_costs_no_extra_calls():
-    """Nothing moving, nothing happening -- do not pester the telescope."""
+def test_a_stationary_status_change_is_logged():
+    """Park and init do not move the mount. The log must still say so.
+
+    On 1.54 the bridge skipped the status read whenever the position had not
+    changed, because every read was an RPC round trip. On 2.0 it is a local
+    read of state the module already pushed, so there is nothing to save --
+    and skipping it meant a telescope could be parked in silence, which is
+    what happened on 2026-08-27.
+    """
+    tel, b, cap = _rig()
+    asyncio.run(b._note_motion())          # baseline: tracking
+    cap.lines.clear()
+    tel.status = "parked"                  # parked, without moving an inch
+    asyncio.run(b._note_motion())
+    assert any("parked" in line for line in cap.lines), cap.lines
+
+
+def test_an_unchanged_status_is_not_repeated():
+    """Reading every second is fine. Printing every second is not.
+
+    This is what the old "do not pester the telescope" test was really
+    protecting -- a readable log -- and that concern outlived the RPC cost
+    that used to justify it.
+    """
     tel, b, cap = _rig()
     asyncio.run(b._note_motion())          # baseline
-    before = tel.status_calls
+    cap.lines.clear()
     for _ in range(5):
         asyncio.run(b._note_motion())
-    assert tel.status_calls == before, f"made {tel.status_calls - before} needless calls"
+    assert not cap.lines, f"repeated an unchanged status: {cap.lines}"
 
 
 def test_third_party_slew_is_logged():

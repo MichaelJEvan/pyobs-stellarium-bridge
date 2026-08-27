@@ -639,8 +639,15 @@ class StellariumBridge:
     async def _note_motion(self) -> None:
         """Log state changes even when someone else moved the telescope.
 
-        Costs an extra RPC only while something is happening: once the mount
-        is settled and the position stops changing, we stop asking.
+        This used to skip the status read whenever the mount had not moved,
+        because on 1.54 every read was an RPC round trip and it was not worth
+        one per second to watch a settled mount. That optimisation cost us
+        park and init: neither moves the mount, so both happened in silence
+        and the log never said the telescope was parked (seen 2026-08-27).
+
+        On 2.0 the saving no longer exists -- get_motion_status is a local
+        read of state the module already pushed us, not a round trip -- so we
+        always ask. Status changes still only print when they change.
         """
         pos = self._tel.last_radec
         if pos is None:
@@ -649,8 +656,6 @@ class StellariumBridge:
             abs(pos[0] - self._last_pos[0]), abs(pos[1] - self._last_pos[1])
         ) > MOVED_THRESHOLD
         self._last_pos = pos
-        if not moved and self._last_status not in (None, "slewing"):
-            return
         try:
             status = await self._tel.get_motion_status()
         except Exception:

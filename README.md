@@ -51,7 +51,7 @@ NINA, KStars, SkySafari — would work too.
 | `nightwatch.py` | Live terminal readout of where the telescope is pointing, read from the bridge. |
 | `slewto.py` | Command-line slewing, by name or coordinates. |
 | `scope.py` | Interactive console — slew, home, park, abort, all from one prompt. |
-| `test_*.py` | Seven test files, 40 tests. None need pyobs or Stellarium. |
+| `test_*.py` | Seven test files, 41 tests. None need pyobs or Stellarium. |
 | `config.yaml` | Your settings — gitignored, copied from the example. |
 | `config.example.yaml` | The template, with placeholders. |
 
@@ -213,12 +213,12 @@ python test_protocol.py    # RA/Dec scaling and packing, 10 tests
 python test_scope.py       # stopping the telescope honestly, 10 tests
 python test_horizon.py     # warning when the mount points into the ground, 6
 python test_slew.py        # slew retry behaviour, 4 tests
-python test_motion.py      # logs motion whoever commanded it, 4
+python test_motion.py      # logs motion whoever commanded it, 5
 python test_proxy.py       # a proxy must not outlive its module, 3
 python test_stale.py       # hangs up rather than showing a stale reticle, 3
 ```
 
-Forty tests, all cold in about a second — nothing else needs to be running.
+Forty-one tests, all cold in about a second — nothing else needs to be running.
 
 ## Behaviour worth knowing
 
