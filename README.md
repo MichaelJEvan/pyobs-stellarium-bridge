@@ -260,9 +260,9 @@ either; it carries on making decisions.
 
 **Abort was a no-op on the 1.54 simulator.** `DummyTelescope.stop_motion` was
 an empty method there, so a simulated slew could not be stopped; `scope.py`
-tries, fails, and says so rather than claiming success. pyobs 2.0 implements
-it — but that path has not been exercised here yet, on the simulator or on
-real hardware.
+tries, fails, and says so rather than claiming success. pyobs 2.0 implements it, and it works: aborting a slew mid-flight stops the
+mount partway and reports the status it actually settled into. Verified on the
+2.0 simulator — not on real hardware.
 
 **A parked telescope ignores slews silently.** pyobs returns from
 `move_radec` without moving and without complaining when the mount is parked,
