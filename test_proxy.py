@@ -92,6 +92,42 @@ def test_it_recovers_when_the_module_comes_back():
     assert third is fourth, "should settle on one proxy again once it is back"
 
 
+def test_a_module_event_replaces_the_proxy_though_presence_never_dropped():
+    """The case a presence check cannot catch, and the reason for the events.
+
+    scope.py only looks at pyobs when you type something. On 2026-08-27 a
+    container restart happened entirely between two of its checks: the module
+    was there before and there after, so nothing looked wrong -- but the
+    subscription had died with the old container and the proxy replayed the
+    new module's startup position for two hours while the bridge tracked
+    correctly. pyobs's own ModuleOpened/ModuleClosed events close that window.
+    """
+    async def run():
+        tel = _telescope()
+        first = await tel._get_proxy()
+        # The module went away and came back while nobody was looking, so
+        # presence never dropped -- exactly the situation that fooled us.
+        await tel._module_changed(bridge.ModuleOpenedEvent(), "telescope")
+        assert tel._comm.clients == ["telescope"], "presence should still look fine"
+        second = await tel._get_proxy()
+        return first, second
+    first, second = asyncio.run(run())
+    assert second is not first, \
+        "a module event must force a fresh proxy even while presence looks fine"
+
+
+def test_an_event_about_another_module_is_ignored():
+    """A camera restarting says nothing about our telescope's subscription."""
+    async def run():
+        tel = _telescope()
+        first = await tel._get_proxy()
+        await tel._module_changed(bridge.ModuleOpenedEvent(), "camera")
+        second = await tel._get_proxy()
+        return first, second
+    first, second = asyncio.run(run())
+    assert second is first, "another module's event must not disturb our proxy"
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:

@@ -49,9 +49,13 @@ try:
     # pyobs 2.0: pointing and motion are published state, not RPC getters, and
     # both are addressed by their interface rather than by method name.
     from pyobs.interfaces import IMotion, IPointingRaDec
+    # Emitted by the comm layer itself when a module goes offline or comes
+    # back, so a client is told rather than having to notice.
+    from pyobs.events import ModuleClosedEvent, ModuleOpenedEvent
 except ImportError:  # the protocol layer below stays usable without pyobs
     XmppComm = None
     IMotion = IPointingRaDec = None
+    ModuleOpenedEvent = ModuleClosedEvent = None
     class RemoteError(Exception): pass
     class RemoteTimeoutError(RemoteError): pass
 
@@ -245,6 +249,7 @@ class PyobsTelescope:
         self._comm = None
         self._proxy = None
         self._stack: contextlib.AsyncExitStack | None = None
+        self._proxy_stale = False        # set by the module-event handler below
         self.connected = False
         self.position_is_fresh = False   # was the last position actually published
                                          # recently, or is it the last thing we heard?
@@ -265,8 +270,49 @@ class PyobsTelescope:
                 await self._comm.close()
             self._comm = None
             raise
+        await self._watch_module()
         self.connected = True
         log.info("pyobs      connected")
+
+    async def _watch_module(self) -> None:
+        """Ask pyobs to tell us when the telescope module comes or goes.
+
+        Checking presence at the moment we resolve a proxy is a sample, not a
+        watch, and a program that sits idle between keystrokes samples very
+        rarely. On 2026-08-27 a container restart happened entirely between
+        two of scope.py's checks: the module left and returned unseen, the
+        subscription died with it, and the proxy went on replaying the first
+        value the new module published -- it showed the sim's startup position
+        for two hours while the bridge, which polls every second and so could
+        not miss the outage, tracked correctly throughout.
+
+        These events come from the comm layer itself, so nothing is missed
+        however long we sit doing nothing.
+        """
+        if ModuleOpenedEvent is None or self._comm is None:
+            return
+        for event_class in (ModuleOpenedEvent, ModuleClosedEvent):
+            try:
+                await self._comm.register_event(event_class, self._module_changed)
+            except Exception as err:
+                # Not fatal: _get_proxy's presence check still covers the
+                # common case. Say so rather than silently losing the watch.
+                log.warning("pyobs      could not watch for %s (%s); falling "
+                            "back to polling presence", event_class.__name__, err)
+
+    async def _module_changed(self, event: object, sender: str) -> bool:
+        """Mark the proxy stale. Do not tear it down here.
+
+        This runs on the comm's own task while another coroutine may be
+        mid-call on that proxy. Setting a flag lets _get_proxy do the swap at
+        a point where nothing is using it.
+        """
+        if sender == self._module:
+            going = isinstance(event, ModuleClosedEvent)
+            log.info("pyobs      telescope module %s; the proxy is stale",
+                     "went away" if going else "reappeared")
+            self._proxy_stale = True
+        return True
 
     async def connect(self) -> None:
         """Keep trying until pyobs answers -- the VM may not be up yet."""
@@ -336,7 +382,7 @@ class PyobsTelescope:
         populated three seconds later. AsyncExitStack is what the upgrade notes
         recommend for a proxy that has to outlive one `async with` block.
         """
-        if self._proxy is not None and not self.module_visible:
+        if self._proxy is not None and (self._proxy_stale or not self.module_visible):
             # The module went away. Its subscription went with it, but the
             # proxy keeps handing back the last value it ever received -- so a
             # caller sees a frozen position and never learns it is frozen.
@@ -349,6 +395,7 @@ class PyobsTelescope:
             await self._stack.__aenter__()
             self._proxy = await self._stack.enter_async_context(
                 self._comm.proxy(self._module))
+            self._proxy_stale = False
         return self._proxy
 
     async def _release_proxy(self) -> None:
