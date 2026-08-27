@@ -46,8 +46,12 @@ except ImportError:      # altitude annotations are a nicety, not a requirement
 try:
     from pyobs.comm.xmpp import XmppComm
     from pyobs.utils.exceptions import RemoteError, RemoteTimeoutError
+    # pyobs 2.0: pointing and motion are published state, not RPC getters, and
+    # both are addressed by their interface rather than by method name.
+    from pyobs.interfaces import IMotion, IPointingRaDec
 except ImportError:  # the protocol layer below stays usable without pyobs
     XmppComm = None
+    IMotion = IPointingRaDec = None
     class RemoteError(Exception): pass
     class RemoteTimeoutError(RemoteError): pass
 
@@ -206,6 +210,13 @@ RETRIES = 3
 MAX_BACKOFF = 30.0    # ceiling on the reconnect backoff
 BAD_POLLS = 3         # consecutive failures before we rebuild the link
 OPEN_TIMEOUT = 20.0   # comm.open() hangs rather than raising if pyobs is away
+STATE_WAIT = 15.0     # how long to wait for a first value after subscribing.
+                      # Deliberately no max_age on the read: a dummy telescope
+                      # publishes only when a slew finishes or while tracking at
+                      # a non-zero rate, so a settled mount stops publishing and
+                      # any max_age would report it as having no position at all.
+                      # Freshness is judged from the value's own timestamp
+                      # instead -- see position_age.
 
 _RETRYABLE = (RemoteError, RemoteTimeoutError, asyncio.TimeoutError, TimeoutError)
 _TIMEOUTS = (RemoteTimeoutError, asyncio.TimeoutError, TimeoutError)
@@ -228,7 +239,11 @@ class PyobsTelescope:
         self._module, self._resource = module, resource
         self._comm = None
         self._proxy = None
+        self._stack: contextlib.AsyncExitStack | None = None
         self.connected = False
+        self.position_is_fresh = False   # was the last position actually published
+                                         # recently, or is it the last thing we heard?
+        self.last_motion_status: str | None = None
         self.last_radec: tuple[float, float] | None = None
         self._last_update = 0.0
 
@@ -275,14 +290,26 @@ class PyobsTelescope:
 
     async def close(self) -> None:
         if self._comm is not None:
+            await self._release_proxy()
             await self._comm.close()
-            self._comm, self._proxy = None, None
+            self._comm = None
             self.connected = False
             log.info("pyobs      link closed")
 
     @property
     def position_age(self) -> float:
-        """Seconds since the position was last read for real."""
+        """Seconds since we last successfully read the position.
+
+        Deliberately NOT the age of the published value. 2.0 state means "what
+        is true right now", and a telescope that has stopped moving stops
+        publishing -- a dummy one publishes only when a slew finishes or while
+        tracking at a non-zero rate. Judging freshness by the value's own
+        timestamp therefore declares a perfectly healthy settled mount stale
+        after ten seconds and hangs up on Stellarium (seen 2026-08-26).
+
+        What this guards against is pyobs being unreachable, and that shows up
+        as a failed read or module_visible going false, not as an old value.
+        """
         if self._last_update == 0.0:
             return float("inf")
         return time.monotonic() - self._last_update
@@ -296,38 +323,113 @@ class PyobsTelescope:
             return False
 
     async def _get_proxy(self):
+        """One proxy, held open for the life of the link.
+
+        State arrives by subscription and the first value lands a second or two
+        after resolving, so a proxy opened and closed per call never receives
+        anything -- measured 2026-08-26 against the 2.0 sim: None on subscribe,
+        populated three seconds later. AsyncExitStack is what the upgrade notes
+        recommend for a proxy that has to outlive one `async with` block.
+        """
+        if self._proxy is not None and not self.module_visible:
+            # The module went away. Its subscription went with it, but the
+            # proxy keeps handing back the last value it ever received -- so a
+            # caller sees a frozen position and never learns it is frozen.
+            # Drop it and resolve a fresh one. (Seen 2026-08-26: scope.py held
+            # a proxy across a container restart and reported "arrived" at a
+            # position 44 degrees from the target for the rest of the session.)
+            await self._release_proxy()
         if self._proxy is None:
-            self._proxy = await self._comm.proxy(self._module)
+            self._stack = contextlib.AsyncExitStack()
+            await self._stack.__aenter__()
+            self._proxy = await self._stack.enter_async_context(
+                self._comm.proxy(self._module))
         return self._proxy
 
-    async def _call(self, method: str, *args, retry_timeouts: bool = True):
-        """Invoke a remote method, riding out the reconnect wart.
+    async def _release_proxy(self) -> None:
+        if self._stack is not None:
+            with contextlib.suppress(Exception):
+                await self._stack.aclose()
+        self._proxy, self._stack = None, None
+
+    async def _with_proxy(self, interface, what: str, body, *,
+                          retry_timeouts: bool = True):
+        """Run `body(proxy)` against a freshly resolved proxy, with retries.
+
+        In pyobs 2.0 a Proxy is a context manager -- `async with comm.proxy(...)`
+        -- and holding one open is no longer the way to keep talking to a
+        module, so there is nothing to cache. Resolving is cheap: state arrives
+        on subscribe, so a proxy has the current value the moment it opens.
 
         retry_timeouts=False for calls where a timeout does not mean failure --
         re-sending them would be actively harmful.
         """
         for attempt in range(1, RETRIES + 1):
             try:
-                proxy = await self._get_proxy()
-                return await getattr(proxy, method)(*args)
+                return await body(await self._get_proxy())
             except _RETRYABLE as err:
                 if not retry_timeouts and isinstance(err, _TIMEOUTS):
                     raise
-                self._proxy = None  # module is reconnecting; re-resolve it
+                await self._release_proxy()   # re-resolve on the next attempt
                 if attempt == RETRIES:
-                    log.error("%s failed after %d attempts: %s", method, RETRIES, err)
+                    log.error("%s failed after %d attempts: %s", what, RETRIES, err)
                     raise
                 log.warning("%s failed (%s), retry %d/%d in %.0f s",
-                            method, type(err).__name__, attempt, RETRIES,
+                            what, type(err).__name__, attempt, RETRIES,
                             RECONNECT_DELAY)
                 await asyncio.sleep(RECONNECT_DELAY)
 
+    @staticmethod
+    async def _read_state(proxy, interface):
+        """Latest published value for an interface, waiting only if we have none.
+
+        get_state is a local read of the cached value -- no round trip. It
+        returns None if nothing has arrived or the value is older than
+        max_age, and only then is it worth waiting for the next publish.
+        """
+        # Deliberately no max_age. pyobs offers one so a dead publisher is not
+        # trusted forever, and for something published on a timer -- weather,
+        # say -- that is right. A telescope publishes only when it arrives
+        # somewhere, so a mount that settled an hour ago has one true value that
+        # happens to be an hour old, and any max_age discards it and reports a
+        # perfectly healthy telescope as having no position at all.
+        #
+        # Liveness is judged by whether the module is there and our subscription
+        # to it is live (see _get_proxy, which drops a proxy whose module has
+        # gone), not by the age of the last thing it said.
+        state = proxy.get_state(interface)
+        if state is None:
+            state = await proxy.wait_for_state(interface, timeout=STATE_WAIT)
+        return state
+
     async def get_radec(self) -> tuple[float, float]:
-        """Current pointing in degrees, J2000. Caches the result."""
-        ra, dec = await self._call("get_radec")
-        self.last_radec = (float(ra), float(dec))
-        self._last_update = time.monotonic()
-        return self.last_radec
+        """Current pointing in degrees, J2000. Caches the result.
+
+        2.0 removed the get_radec RPC: the telescope publishes RaDecState and
+        we read the last value. Nothing is asked of the module, so a busy or
+        sulking one cannot stall us.
+        """
+        async def read(proxy):
+            return await self._read_state(proxy, IPointingRaDec)
+
+        state = await self._with_proxy(IPointingRaDec, "get_radec", read)
+        if state is not None:
+            self.last_radec = (float(state.ra), float(state.dec))
+            self._last_update = time.monotonic()
+            self.position_is_fresh = True
+            return self.last_radec
+
+        # Nothing fresh. If the module is still there, the mount has simply not
+        # moved -- keep the last position rather than blanking the reticle, but
+        # say it is not fresh so callers that need certainty (has it arrived?)
+        # can refuse to answer. If the module is gone, we genuinely do not know.
+        if self.module_visible and self.last_radec is not None:
+            self._last_update = time.monotonic()
+            self.position_is_fresh = False
+            return self.last_radec
+        self.position_is_fresh = False
+        raise RemoteTimeoutError("no RaDecState published within "
+                                 f"{STATE_WAIT:.0f} s")
 
     async def wait_until_settled(self, timeout: float = SLEW_TIMEOUT) -> bool:
         """Poll motion status until the mount stops moving."""
@@ -356,15 +458,39 @@ class PyobsTelescope:
         """
         log.info("pyobs      slewing to RA %.4f Dec %.4f", ra_deg, dec_deg)
         try:
-            await self._call("move_radec", ra_deg, dec_deg, retry_timeouts=False)
+            async def go(proxy):
+                return await proxy.move_radec(ra_deg, dec_deg)
+
+            await self._with_proxy(IPointingRaDec, "move_radec", go,
+                                   retry_timeouts=False)
         except _TIMEOUTS:
             log.info("move_radec RPC timed out; the slew is probably still "
                      "running, watching motion status")
             await self.wait_until_settled()
 
     async def get_motion_status(self) -> str:
-        """Lowercase status string, e.g. 'idle' / 'slewing'."""
-        return str(await self._call("get_motion_status")).lower()
+        """Lowercase status string, e.g. 'idle' / 'slewing'.
+
+        2.0 publishes MotionState instead of answering get_motion_status. It
+        carries an overall `status` plus a per-device list; the overall one is
+        what the reticle and the slew watcher care about.
+        """
+        async def read(proxy):
+            return await self._read_state(proxy, IMotion)
+
+        state = await self._with_proxy(IMotion, "get_motion_status", read)
+        if state is not None:
+            self.last_motion_status = str(state.status).lower()
+            return self.last_motion_status
+
+        # Motion status is published on change, not on a timer, so a mount that
+        # settled an hour ago has nothing recent to offer -- and that is not the
+        # same as not knowing. While the module is there, its last announced
+        # status still stands; only its disappearance means we have lost track.
+        if self.module_visible and self.last_motion_status is not None:
+            return self.last_motion_status
+        raise RemoteTimeoutError("no MotionState published within "
+                                 f"{STATE_WAIT:.0f} s")
 
 # ---------------------------------------------------------------------------
 # Stellarium TCP server

@@ -158,7 +158,15 @@ class Console:
             await move
             landed = await self.tel.get_radec()
             off = separation_arcsec(*landed, ra, dec)
-            print(f"  arrived: {describe(*landed)}   ({off:.1f} arcsec off)")
+            if self.tel.position_is_fresh:
+                print(f"  arrived: {describe(*landed)}   ({off:.1f} arcsec off)")
+            else:
+                # The telescope has not published a position recently, so the
+                # only reading we have is whatever it last said -- which may
+                # predate the slew entirely. Saying "arrived" here would put a
+                # position in front of the operator that nothing has confirmed.
+                print(f"  cannot confirm arrival -- no fresh position from the "
+                      f"telescope. Last reported: {describe(*landed)}")
             # Move Stellarium's view too, the same way slewto does. Silent if
             # the RemoteControl plugin is not enabled.
             tell_stellarium(label or None, ra, dec)

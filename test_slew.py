@@ -13,8 +13,20 @@ import bridge
 from bridge import PyobsTelescope
 
 
+class FakeState:
+    """Stands in for pyobs 2.0's MotionState."""
+
+    def __init__(self, status):
+        self.status = status
+
+
 class FakeProxy:
-    """Stands in for a pyobs telescope proxy."""
+    """Stands in for a pyobs 2.0 telescope proxy.
+
+    Motion is published state now, so the mount is watched by reading
+    get_state rather than by calling a get_motion_status RPC. move_radec is
+    still a real remote call.
+    """
 
     def __init__(self, move_raises=None, statuses=("tracking",)):
         self.move_raises = move_raises
@@ -27,23 +39,44 @@ class FakeProxy:
         if self.move_raises is not None:
             raise self.move_raises
 
-    async def get_motion_status(self):
+    def get_state(self, interface, *, max_age=None):
+        if interface is not bridge.IMotion:
+            return None
         self.status_calls += 1
-        return self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        return FakeState(status)
+
+    async def wait_for_state(self, interface, timeout=10.0, *, max_age=None):
+        return self.get_state(interface, max_age=max_age)
+
+
+class FakeComm:
+    """Yields the fake proxy from `async with comm.proxy(...)`, as 2.0 does."""
+
+    def __init__(self, proxy):
+        self._proxy = proxy
+
+    def proxy(self, _name, _interface=None):
+        proxy = self._proxy
+
+        class _Ctx:
+            async def __aenter__(self):
+                return proxy
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        return _Ctx()
 
 
 def _telescope(proxy):
-    """A telescope whose proxy lookup always yields the fake.
+    """A telescope whose every proxy lookup yields the fake.
 
-    _call drops its cached proxy on a RemoteError, so pinning it here keeps
-    the fake alive across retries.
+    2.0 resolves a proxy per call instead of caching one, so the fake has to
+    come back from the comm each time rather than be pinned once.
     """
     tel = PyobsTelescope()
-
-    async def _always_the_fake():
-        return proxy
-
-    tel._get_proxy = _always_the_fake
+    tel._comm = FakeComm(proxy)
     return tel
 
 
