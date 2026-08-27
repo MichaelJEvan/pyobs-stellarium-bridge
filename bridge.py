@@ -219,6 +219,11 @@ RETRIES = 3
 MAX_BACKOFF = 30.0    # ceiling on the reconnect backoff
 BAD_POLLS = 3         # consecutive failures before we rebuild the link
 OPEN_TIMEOUT = 20.0   # comm.open() hangs rather than raising if pyobs is away
+POSITION_REFRESH = 1.0  # while a slew is running, keep last_radec current at
+                        # the rate the telescope publishes. Costs nothing --
+                        # a read is a local cache lookup, measured under 10 ms
+                        # -- and it is what makes "last seen at" mean the last
+                        # position rather than the one before the slew began.
 STATE_WAIT = 15.0     # how long to wait for a first value after subscribing.
                       # Deliberately no max_age on the read: a dummy telescope
                       # publishes only when a slew finishes or while tracking at
@@ -539,11 +544,27 @@ class PyobsTelescope:
         async def go(proxy):
             return await proxy.move_radec(ra_deg, dec_deg)
 
+        async def keep_position_current():
+            """Read the published position while the slew runs.
+
+            A client blocked in move_radec otherwise learns nothing for the
+            whole slew, so if contact is lost the newest position it can name
+            is the one from before it started moving. Seen 2026-08-27: the
+            mount had travelled about 40 degrees, and scope.py reported it as
+            last seen at Polaris. On real hardware that is the number an
+            operator would act on.
+            """
+            while True:
+                await asyncio.sleep(POSITION_REFRESH)
+                with contextlib.suppress(Exception):
+                    await self.get_radec()
+
         self._module_lost.clear()
         slew = asyncio.ensure_future(
             self._with_proxy(IPointingRaDec, "move_radec", go,
                              retry_timeouts=False))
         lost = asyncio.ensure_future(self._module_lost.wait())
+        watch = asyncio.ensure_future(keep_position_current())
         try:
             done, _ = await asyncio.wait({slew, lost},
                                          return_when=asyncio.FIRST_COMPLETED)
@@ -561,7 +582,7 @@ class PyobsTelescope:
                      "running, watching motion status")
             await self.wait_until_settled()
         finally:
-            for task in (slew, lost):
+            for task in (slew, lost, watch):
                 if not task.done():
                     task.cancel()
                     with contextlib.suppress(BaseException):

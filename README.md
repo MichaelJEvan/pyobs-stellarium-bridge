@@ -51,7 +51,7 @@ NINA, KStars, SkySafari — would work too.
 | `nightwatch.py` | Live terminal readout of where the telescope is pointing, read from the bridge. |
 | `slewto.py` | Command-line slewing, by name or coordinates. |
 | `scope.py` | Interactive console — slew, home, park, abort, all from one prompt. |
-| `test_*.py` | Seven test files, 47 tests. None need pyobs or Stellarium. |
+| `test_*.py` | Seven test files, 48 tests. None need pyobs or Stellarium. |
 | `config.yaml` | Your settings — gitignored, copied from the example. |
 | `config.example.yaml` | The template, with placeholders. |
 
@@ -212,13 +212,13 @@ Stellarium, shut the laptop: the mount carries on.
 python test_protocol.py    # RA/Dec scaling and packing, 10 tests
 python test_scope.py       # stopping the telescope honestly, 10 tests
 python test_horizon.py     # warning when the mount points into the ground, 6
-python test_slew.py        # slew retries, and giving up when the module dies, 7
+python test_slew.py        # slew retries, and giving up when the module dies, 8
 python test_motion.py      # logs motion whoever commanded it, 5
 python test_proxy.py       # a proxy must not outlive its module, 6
 python test_stale.py       # hangs up rather than showing a stale reticle, 3
 ```
 
-Forty-seven tests, all cold in about a second — nothing else needs to be running.
+Forty-eight tests, all cold in about a second — nothing else needs to be running.
 
 ## Behaviour worth knowing
 
@@ -269,7 +269,9 @@ mount partway and reports the status it actually settled into. Verified on the
 mount that might really take that long. If the module dies, though, that is
 twenty minutes of silence while nothing can command the mount at all. The
 suite listens for the module going away and abandons the wait within seconds,
-saying where the telescope was when contact went. It is not an interlock:
+naming where the telescope actually was when contact went -- the
+position is refreshed every second while a slew runs, so that number is the
+last one the mount reported rather than the one before it started moving. It is not an interlock:
 nothing in software can stop a mount whose control module has died. What stops
 it is the mount's own limits and a power cutoff you can reach.
 
