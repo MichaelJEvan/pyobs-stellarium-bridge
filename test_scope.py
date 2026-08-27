@@ -30,11 +30,19 @@ class FakeTelescope:
         await asyncio.sleep(30)          # long enough to be interrupted
         self.status = "tracking"
 
-    async def _call(self, method, *args):
-        self.calls.append(method)
-        if method == "stop_motion":
-            self.status = "tracking"
-        return None
+    # The real methods, not a catch-all _call. A fake that answers any name
+    # will happily pass while the real class has no such method -- which is
+    # exactly how scope.py's abort, park and init stayed broken through the
+    # 2.0 port with these tests green.
+    async def stop_motion(self):
+        self.calls.append("stop_motion")
+        self.status = "tracking"
+
+    async def init(self):
+        self.calls.append("init")
+
+    async def park(self):
+        self.calls.append("park")
 
 
 def _console(status="tracking"):
@@ -125,13 +133,11 @@ def test_stop_retries_when_a_slew_lands_after_it():
             super().__init__(status="slewing")
             self.stops = 0
 
-        async def _call(self, method, *args):
-            self.calls.append(method)
-            if method == "stop_motion":
-                self.stops += 1
-                if self.stops >= 2:        # the first one misses
-                    self.status = "tracking"
-            return None
+        async def stop_motion(self):
+            self.calls.append("stop_motion")
+            self.stops += 1
+            if self.stops >= 2:            # the first one misses
+                self.status = "tracking"
 
     async def go():
         tel = LateSlew()
@@ -149,9 +155,8 @@ def test_stop_admits_when_it_cannot_stop_it():
     class Runaway(FakeTelescope):
         def __init__(self):
             super().__init__(status="slewing")
-        async def _call(self, method, *args):
-            self.calls.append(method)
-            return None                     # never stops
+        async def stop_motion(self):
+            self.calls.append("stop_motion")   # and never actually stops
 
     async def go():
         tel = Runaway()
@@ -175,11 +180,9 @@ def test_stop_accepts_any_non_slewing_state():
         class Stops(FakeTelescope):
             def __init__(self):
                 super().__init__(status="slewing")
-            async def _call(self, method, *args):
-                self.calls.append(method)
-                if method == "stop_motion":
-                    self.status = landed_in
-                return None
+            async def stop_motion(self):
+                self.calls.append("stop_motion")
+                self.status = landed_in
 
         async def go():
             tel = Stops()
@@ -203,12 +206,10 @@ def test_aborting_is_not_stopped_yet():
             super().__init__(status="slewing")
             self.seen = []
 
-        async def _call(self, method, *args):
-            self.calls.append(method)
-            if method == "stop_motion":
-                # first stop starts the abort, it finishes a moment later
-                self.status = "aborting" if self.status == "slewing" else "idle"
-            return None
+        async def stop_motion(self):
+            self.calls.append("stop_motion")
+            # first stop starts the abort, it finishes a moment later
+            self.status = "aborting" if self.status == "slewing" else "idle"
 
         async def get_motion_status(self):
             self.seen.append(self.status)

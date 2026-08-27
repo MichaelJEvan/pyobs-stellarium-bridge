@@ -26,3 +26,6 @@ slewto:                          # the command-line slew tool
 scope:                           # the interactive console
                                  # (its own account -- never shared)
   jid: console@localhost
+  # home: Polaris                # optional: where `h` sends the mount.
+                                 # Omitted, it picks the pole star for your
+                                 # hemisphere from site.latitude above.

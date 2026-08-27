@@ -194,7 +194,7 @@ class Console:
         print(f"  {why} -- stopping the telescope...")
         for attempt in range(1, STOP_ATTEMPTS + 1):
             try:
-                await self.tel._call("stop_motion")
+                await self.tel.stop_motion()
             except Exception as err:
                 print(f"  stop_motion failed: {err}")
             await asyncio.sleep(STOP_SETTLE)
@@ -219,7 +219,7 @@ class Console:
     async def _init(self) -> None:
         print("  initialising...")
         try:
-            await self.tel._call("init")
+            await self.tel.init()
             print(f"  {await self.tel.get_motion_status()}")
         except Exception as err:
             print(f"  init failed: {err}")
@@ -227,7 +227,7 @@ class Console:
     async def _park(self) -> None:
         print("  parking...")
         try:
-            await self.tel._call("park")
+            await self.tel.park()
             print(f"  parked at {describe(*await self.tel.get_radec())}")
         except Exception as err:
             print(f"  park failed: {err}")

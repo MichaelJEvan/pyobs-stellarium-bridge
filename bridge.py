@@ -142,6 +142,11 @@ SLEWTO_JID = "scratch@localhost"
 # makes the two kick each other off in a loop.
 SCOPE_JID = "console@localhost"
 
+# scope.py's `h` command. None means "pick the pole star for this hemisphere"
+# from the site latitude, which is what almost everyone wants. Set `scope.home`
+# in config.yaml to override it -- anything slewto.py accepts as a target.
+HOME_TARGET = None
+
 CONFIG_FILE = pathlib.Path(__file__).with_name("config.yaml")
 CONFIG_APPLIED: list[str] = []   # filled by load_config, reported once logging is up
 
@@ -152,7 +157,7 @@ _CONFIG_KEYS = {
              "elevation": "SITE_ELEV"},
     "listen": {"host": "HOST", "port": "PORT"},
     "slewto": {"jid": "SLEWTO_JID"},
-    "scope": {"jid": "SCOPE_JID"},
+    "scope": {"jid": "SCOPE_JID", "home": "HOME_TARGET"},
 }
 
 
@@ -491,6 +496,48 @@ class PyobsTelescope:
             return self.last_motion_status
         raise RemoteTimeoutError("no MotionState published within "
                                  f"{STATE_WAIT:.0f} s")
+
+    # -- IMotion commands ------------------------------------------------
+    # These used to be reached through _call(), which the 2.0 port replaced
+    # with _with_proxy. Nothing took over the three command names, so
+    # scope.py's abort, park and init quietly stopped working -- they caught
+    # the AttributeError and reported failure honestly, which is the only
+    # reason it was not worse. They belong here rather than in scope.py:
+    # PyobsTelescope is the part meant to be reused, and an Alpaca server
+    # would want them too.
+    #
+    # Signatures checked against the installed pyobs 2.0.1:
+    #   init(**kwargs), park(**kwargs), stop_motion(device=None, **kwargs)
+
+    async def stop_motion(self) -> None:
+        """Stop the mount. No device name stops everything the module drives.
+
+        Retries on timeout, unlike move_radec: re-issuing a stop is harmless,
+        and scope.py deliberately issues it more than once because a slew
+        already in flight can land after the first one.
+        """
+        async def go(proxy):
+            return await proxy.stop_motion()
+
+        await self._with_proxy(IMotion, "stop_motion", go)
+
+    async def init(self) -> None:
+        """Wake a parked mount.
+
+        Blocks while the mount initialises, so a timeout does not mean it
+        failed -- same reasoning as move_radec. Do not re-send.
+        """
+        async def go(proxy):
+            return await proxy.init()
+
+        await self._with_proxy(IMotion, "init", go, retry_timeouts=False)
+
+    async def park(self) -> None:
+        """Park the mount. Blocks while it parks, so a timeout is not failure."""
+        async def go(proxy):
+            return await proxy.park()
+
+        await self._with_proxy(IMotion, "park", go, retry_timeouts=False)
 
 # ---------------------------------------------------------------------------
 # Stellarium TCP server
