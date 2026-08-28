@@ -1,4 +1,6 @@
 config.yaml
+# one config per telescope; config.example.yaml stays tracked
+config-*.yaml
 __pycache__/
 .DS_Store
 .vscode/

@@ -15,11 +15,13 @@
 
 *******************************************************************************"""
 
+import argparse
 import asyncio
 import contextlib
 import logging
 import pathlib
 import struct
+import sys
 import time
 
 # slixmpp logs a stringprep warning the moment it is imported, before anything
@@ -151,8 +153,39 @@ SCOPE_JID = "console@localhost"
 # in config.yaml to override it -- anything slewto.py accepts as a target.
 HOME_TARGET = None
 
-CONFIG_FILE = pathlib.Path(__file__).with_name("config.yaml")
+DEFAULT_CONFIG = pathlib.Path(__file__).with_name("config.yaml")
 CONFIG_APPLIED: list[str] = []   # filled by load_config, reported once logging is up
+
+
+def _config_from_argv() -> pathlib.Path:
+    """Choose the config file, at import, before anything reads it.
+
+    Two reasons it happens here rather than in __main__:
+
+    The class defaults below (`jid: str = JID`, `module: str = TELESCOPE`)
+    are bound when Python defines the class, which is further down this file.
+    Loading a different config after that point changes the globals and
+    nothing else -- the bridge would go on using the first config's telescope
+    while the log claimed otherwise.
+
+    And argv is only consulted when bridge.py is the program being run.
+    slewto.py and scope.py import this module and parse their own arguments;
+    reading argv unconditionally would swallow theirs.
+    """
+    if pathlib.Path(sys.argv[0]).name != "bridge.py":
+        return DEFAULT_CONFIG
+    parser = argparse.ArgumentParser(
+        description="Report a pyobs telescope's position to Stellarium, and "
+                    "forward Stellarium's slews back to pyobs.")
+    parser.add_argument(
+        "--config", metavar="PATH", type=pathlib.Path, default=DEFAULT_CONFIG,
+        help="settings file (default: config.yaml beside this script). Give "
+             "each telescope its own, with its own pyobs.module, pyobs.jid "
+             "and listen.port, and run one bridge per telescope.")
+    return parser.parse_args().config
+
+
+CONFIG_FILE = _config_from_argv()
 
 _CONFIG_KEYS = {
     "pyobs": {"server": "SERVER", "jid": "JID", "password": "PASSWORD",
@@ -208,7 +241,7 @@ def load_config(path: pathlib.Path = CONFIG_FILE) -> None:
     CONFIG_APPLIED.extend(applied)
 
 # Must run before anything below binds these as default arguments.
-load_config()
+load_config(CONFIG_FILE)
 
 RESOURCE = "pyobs"     # must match the modules: pyobs addresses peers as
                        # <module>@<domain>/<own resource>, so changing this
