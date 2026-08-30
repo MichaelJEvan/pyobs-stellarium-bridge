@@ -366,8 +366,13 @@ class PyobsTelescope:
         """
         if sender == self._module:
             going = isinstance(event, ModuleClosedEvent)
-            log.info("pyobs      telescope module %s; the proxy is stale",
-                     "went away" if going else "reappeared")
+            # Say what happened and what follows from it, not what it did to
+            # our internals. "the proxy is stale" was accurate and read as a
+            # fault to anyone who did not know what a proxy was -- and this
+            # line appears every time the module restarts, which is normal.
+            log.info("pyobs      telescope module %s",
+                     "went away; will reconnect when it returns" if going
+                     else "is back; getting a fresh connection")
             self._proxy_stale = True
             # Anything blocked waiting on the module is waiting for an answer
             # that is no longer coming. Say so now rather than sitting quiet
