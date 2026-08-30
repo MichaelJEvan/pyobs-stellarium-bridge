@@ -225,12 +225,28 @@ class Console:
             print(f"  init failed: {err}")
 
     async def _park(self) -> None:
+        """Park, and stay interruptible while it happens.
+
+        A park is a slew -- often the longest of the night, right across the
+        sky, and the one most likely to be heading somewhere you did not
+        intend. It used to be awaited straight from the command loop, which
+        blocked the prompt: an `abort` typed while it ran sat in the input
+        buffer until the park finished, and was then answered with "nothing to
+        abort -- the telescope is parked". Measured 2026-08-30. The mount was
+        uninterruptible for the whole move and nothing said so.
+        """
         print("  parking...")
         try:
             await self.tel.park()
             print(f"  parked at {describe(*await self.tel.get_radec())}")
+            _redraw_prompt()
+        except asyncio.CancelledError:
+            if not self.abandoning:
+                await self._stop("park cancelled")
+            raise
         except Exception as err:
             print(f"  park failed: {err}")
+            _redraw_prompt()
 
     async def _where(self) -> None:
         try:
@@ -289,7 +305,7 @@ class Console:
 
     async def do_target(self) -> None:
         if self._busy():
-            print("  already slewing -- abort first")
+            print("  the mount is already moving -- abort first")
             return
         if not await self._awake():        # ask before making them type a target
             return
@@ -305,7 +321,7 @@ class Console:
 
     async def do_home(self) -> None:
         if self._busy():
-            print("  already slewing -- abort first")
+            print("  the mount is already moving -- abort first")
             return
         if not await self._awake():
             return
@@ -347,12 +363,15 @@ class Console:
 
     async def do_park(self) -> None:
         if self._busy():
-            print("  slewing -- abort first")
+            print("  the mount is already moving -- abort first")
             return
         if (await ainput("  park the telescope? (y/N): ")).strip().lower() != "y":
             print("  left alone")
             return
-        await self._park()
+        # Same slot a slew uses, so `abort` cancels it and _busy() knows the
+        # mount is under our command. One idea -- "we are moving it" -- rather
+        # than two that behave differently.
+        self.slewing = asyncio.create_task(self._park())
 
     # -- the loop -----------------------------------------------------------
 
