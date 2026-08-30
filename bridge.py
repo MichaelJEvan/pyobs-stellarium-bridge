@@ -157,31 +157,39 @@ DEFAULT_CONFIG = pathlib.Path(__file__).with_name("config.yaml")
 CONFIG_APPLIED: list[str] = []   # filled by load_config, reported once logging is up
 
 
+# Programs that accept --config, and what to say when they are asked for help.
+# slewto.py is deliberately absent: it has arguments of its own (the target),
+# and parsing argv on its behalf here would swallow them.
+_TAKES_CONFIG = {
+    "bridge.py": "Report a pyobs telescope's position to Stellarium, and "
+                 "forward Stellarium's slews back to pyobs.",
+    "scope.py": "Interactive console for one pyobs telescope: slew, home, "
+                "park, abort, init.",
+}
+
+
 def _config_from_argv() -> pathlib.Path:
     """Choose the config file, at import, before anything reads it.
 
-    Two reasons it happens here rather than in __main__:
+    It happens here rather than in __main__ because the class defaults below
+    (`jid: str = JID`, `module: str = TELESCOPE`) are bound when Python defines
+    the class, further down this file. Loading a different config after that
+    point changes the globals and nothing else -- the program would go on using
+    the first config's telescope while the log claimed otherwise.
 
-    The class defaults below (`jid: str = JID`, `module: str = TELESCOPE`)
-    are bound when Python defines the class, which is further down this file.
-    Loading a different config after that point changes the globals and
-    nothing else -- the bridge would go on using the first config's telescope
-    while the log claimed otherwise.
-
-    And argv is only consulted when bridge.py is the program being run.
-    slewto.py and scope.py import this module and parse their own arguments;
-    reading argv unconditionally would swallow theirs.
+    And argv is consulted only for the programs listed in _TAKES_CONFIG, since
+    anything importing this module gets this function run on its behalf.
     """
-    if pathlib.Path(sys.argv[0]).name != "bridge.py":
+    description = _TAKES_CONFIG.get(pathlib.Path(sys.argv[0]).name)
+    if description is None:
         return DEFAULT_CONFIG
-    parser = argparse.ArgumentParser(
-        description="Report a pyobs telescope's position to Stellarium, and "
-                    "forward Stellarium's slews back to pyobs.")
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--config", metavar="PATH", type=pathlib.Path, default=DEFAULT_CONFIG,
         help="settings file (default: config.yaml beside this script). Give "
-             "each telescope its own, with its own pyobs.module, pyobs.jid "
-             "and listen.port, and run one bridge per telescope.")
+             "each telescope its own, with its own pyobs.module and pyobs.jid "
+             "-- and its own listen.port for the bridge -- then run one "
+             "bridge, and one console, per telescope.")
     return parser.parse_args().config
 
 
