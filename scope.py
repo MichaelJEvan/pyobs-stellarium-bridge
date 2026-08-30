@@ -207,8 +207,20 @@ class Console:
             # call a stopped mount -- idle, positioned, tracking -- but they
             # all agree on what moving looks like.
             if status is not None and status not in MOVING:
-                print(f"  stopped ({status}) at "
-                      f"{describe(*await self.tel.get_radec())}")
+                # "Stopped" is true of an idle or parked mount and misleading
+                # of a tracking one. INDI's abort deliberately restores
+                # whatever the mount was doing before the move -- see
+                # inditelescope.cpp, "Abort shouldn't affect tracking state"
+                # -- so a mount that was tracking before the slew is tracking
+                # again after, at sidereal rate, on whatever patch of sky it
+                # happened to stop over. That is framework behaviour, not a
+                # simulator quirk, so it will be true of the AM3 as well.
+                # Abort cancels the instruction; it does not stop the mount.
+                where = describe(*await self.tel.get_radec())
+                if status == "tracking":
+                    print(f"  stopped moving -- still tracking at {where}")
+                else:
+                    print(f"  stopped ({status}) at {where}")
                 return
             if attempt < STOP_ATTEMPTS:
                 print(f"  still {status} -- stopping again "
