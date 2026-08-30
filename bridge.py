@@ -856,12 +856,27 @@ class StellariumBridge:
 
     @property
     def _stale(self) -> bool:
-        """Is the cached position too old to put in front of someone?
+        """Is the cached position too good to show, or the telescope too lost?
 
-        Short blips ride through on the last known position; past STALE_AFTER
-        we hang up instead, so Stellarium shows Disconnected rather than a
-        confident reticle pointing at where the telescope used to be.
+        Two different ways of not knowing where a telescope is pointing.
+
+        It can go quiet: the read fails or the module vanishes, and that shows
+        up as age. Short blips ride through on the last known position; past
+        STALE_AFTER we hang up, so Stellarium shows Disconnected rather than a
+        confident reticle over where the telescope used to be.
+
+        Or it can be right there, answering every read, and honestly say it
+        has no idea -- which is what the INDI module now reports when its own
+        link to the mount dies. Age cannot see that: pyobs keeps handing back
+        the last value it was given, so every read succeeds and the clock
+        never starts. Seen 2026-08-30, the module said `unknown` for a quarter
+        of an hour while the reticle sat in the sky looking authoritative.
+
+        A module admitting it does not know is better evidence than any
+        timer, so it is taken at its word.
         """
+        if self._tel.last_motion_status == "unknown":
+            return True
         return self._tel.position_age > STALE_AFTER
 
     async def _send_forever(self, writer: asyncio.StreamWriter) -> None:
