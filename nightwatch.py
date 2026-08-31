@@ -133,7 +133,7 @@ def render(state: dict, width: int = 80) -> list[str]:
         lines.append(f"  Az   {angle_dms(az):>13} {az:>9.4f}°")
         if state.get("meridian") is not None:
             lines.append("")
-            lines.append(f"  Meridian{meridian_line(state['meridian']):>26}")
+            lines.append(f"  Meridian{meridian_line(state['meridian']):>24}")
 
     # Rule ends one character past the widest row, rather than running on to
     # the edge of the terminal.
