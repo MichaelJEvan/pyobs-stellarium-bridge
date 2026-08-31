@@ -75,7 +75,7 @@ def meridian_minutes(ra_deg: float, site: EarthLocation) -> float:
 def meridian_line(minutes: float) -> str:
     m = abs(minutes)
     clock = f"{int(m // 60)}h {int(m % 60):02d}m" if m >= 60 else f"{int(m)}m {int(m % 1 * 60):02d}s"
-    return f"in {clock}" if minutes >= 0 else f"crossed {clock} ago"
+    return clock if minutes >= 0 else f"crossed {clock} ago"
 
 
 def ra_hms(ra_deg: float) -> str:
