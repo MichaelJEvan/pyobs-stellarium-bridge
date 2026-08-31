@@ -19,6 +19,7 @@ class FakeTelescope:
         self.last_radec = (213.915, 19.182)
         self.age = 0.0
         self.connected = True
+        self.last_motion_status = "tracking"
 
     @property
     def position_age(self):
@@ -69,6 +70,20 @@ async def scenario():
     await asyncio.sleep(0.5)
     results["recovers"] = await _read_one() is not None
 
+    # A module that is present, answering, and says it has no idea.
+    # Introduced 2026-08-30 by the INDI module: when its link to the mount
+    # dies it reports `unknown` and stops publishing, but pyobs keeps handing
+    # back the last value it was given, so the read still succeeds and the age
+    # never grows. Age alone cannot see this -- and the reticle sat in
+    # Stellarium looking authoritative while the mount was unreachable.
+    tel.last_motion_status = "unknown"
+    await asyncio.sleep(0.5)
+    results["unknown_refuses"] = await _read_one() is None
+
+    tel.last_motion_status = "tracking"
+    await asyncio.sleep(0.5)
+    results["recovers_from_unknown"] = await _read_one() is not None
+
     server.cancel()
     return results
 
@@ -78,6 +93,8 @@ def test_stale_handling():
     assert r["fresh_serves"], "fresh position should be served"
     assert r["stale_refuses"], "stale position should NOT be served"
     assert r["recovers"], "should serve again once the position is fresh"
+    assert r["unknown_refuses"], "a telescope reporting unknown must NOT be drawn"
+    assert r["recovers_from_unknown"], "should serve again once the status is real"
     return r
 
 

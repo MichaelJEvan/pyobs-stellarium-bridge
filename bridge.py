@@ -15,11 +15,13 @@
 
 *******************************************************************************"""
 
+import argparse
 import asyncio
 import contextlib
 import logging
 import pathlib
 import struct
+import sys
 import time
 
 # slixmpp logs a stringprep warning the moment it is imported, before anything
@@ -151,8 +153,47 @@ SCOPE_JID = "console@localhost"
 # in config.yaml to override it -- anything slewto.py accepts as a target.
 HOME_TARGET = None
 
-CONFIG_FILE = pathlib.Path(__file__).with_name("config.yaml")
+DEFAULT_CONFIG = pathlib.Path(__file__).with_name("config.yaml")
 CONFIG_APPLIED: list[str] = []   # filled by load_config, reported once logging is up
+
+
+# Programs that accept --config, and what to say when they are asked for help.
+# slewto.py is deliberately absent: it has arguments of its own (the target),
+# and parsing argv on its behalf here would swallow them.
+_TAKES_CONFIG = {
+    "bridge.py": "Report a pyobs telescope's position to Stellarium, and "
+                 "forward Stellarium's slews back to pyobs.",
+    "scope.py": "Interactive console for one pyobs telescope: slew, home, "
+                "park, abort, init.",
+}
+
+
+def _config_from_argv() -> pathlib.Path:
+    """Choose the config file, at import, before anything reads it.
+
+    It happens here rather than in __main__ because the class defaults below
+    (`jid: str = JID`, `module: str = TELESCOPE`) are bound when Python defines
+    the class, further down this file. Loading a different config after that
+    point changes the globals and nothing else -- the program would go on using
+    the first config's telescope while the log claimed otherwise.
+
+    And argv is consulted only for the programs listed in _TAKES_CONFIG, since
+    anything importing this module gets this function run on its behalf.
+    """
+    description = _TAKES_CONFIG.get(pathlib.Path(sys.argv[0]).name)
+    if description is None:
+        return DEFAULT_CONFIG
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument(
+        "--config", metavar="PATH", type=pathlib.Path, default=DEFAULT_CONFIG,
+        help="settings file (default: config.yaml beside this script). Give "
+             "each telescope its own, with its own pyobs.module and pyobs.jid "
+             "-- and its own listen.port for the bridge -- then run one "
+             "bridge, and one console, per telescope.")
+    return parser.parse_args().config
+
+
+CONFIG_FILE = _config_from_argv()
 
 _CONFIG_KEYS = {
     "pyobs": {"server": "SERVER", "jid": "JID", "password": "PASSWORD",
@@ -208,7 +249,7 @@ def load_config(path: pathlib.Path = CONFIG_FILE) -> None:
     CONFIG_APPLIED.extend(applied)
 
 # Must run before anything below binds these as default arguments.
-load_config()
+load_config(CONFIG_FILE)
 
 RESOURCE = "pyobs"     # must match the modules: pyobs addresses peers as
                        # <module>@<domain>/<own resource>, so changing this
@@ -325,8 +366,13 @@ class PyobsTelescope:
         """
         if sender == self._module:
             going = isinstance(event, ModuleClosedEvent)
-            log.info("pyobs      telescope module %s; the proxy is stale",
-                     "went away" if going else "reappeared")
+            # Say what happened and what follows from it, not what it did to
+            # our internals. "the proxy is stale" was accurate and read as a
+            # fault to anyone who did not know what a proxy was -- and this
+            # line appears every time the module restarts, which is normal.
+            log.info("pyobs      telescope module %s",
+                     "went away; will reconnect when it returns" if going
+                     else "is back; getting a fresh connection")
             self._proxy_stale = True
             # Anything blocked waiting on the module is waiting for an answer
             # that is no longer coming. Say so now rather than sitting quiet
@@ -823,12 +869,27 @@ class StellariumBridge:
 
     @property
     def _stale(self) -> bool:
-        """Is the cached position too old to put in front of someone?
+        """Is the cached position too good to show, or the telescope too lost?
 
-        Short blips ride through on the last known position; past STALE_AFTER
-        we hang up instead, so Stellarium shows Disconnected rather than a
-        confident reticle pointing at where the telescope used to be.
+        Two different ways of not knowing where a telescope is pointing.
+
+        It can go quiet: the read fails or the module vanishes, and that shows
+        up as age. Short blips ride through on the last known position; past
+        STALE_AFTER we hang up, so Stellarium shows Disconnected rather than a
+        confident reticle over where the telescope used to be.
+
+        Or it can be right there, answering every read, and honestly say it
+        has no idea -- which is what the INDI module now reports when its own
+        link to the mount dies. Age cannot see that: pyobs keeps handing back
+        the last value it was given, so every read succeeds and the clock
+        never starts. Seen 2026-08-30, the module said `unknown` for a quarter
+        of an hour while the reticle sat in the sky looking authoritative.
+
+        A module admitting it does not know is better evidence than any
+        timer, so it is taken at its word.
         """
+        if self._tel.last_motion_status == "unknown":
+            return True
         return self._tel.position_age > STALE_AFTER
 
     async def _send_forever(self, writer: asyncio.StreamWriter) -> None:

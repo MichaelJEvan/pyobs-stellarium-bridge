@@ -43,6 +43,9 @@ class FakeTelescope:
 
     async def park(self):
         self.calls.append("park")
+        self.status = "parking"
+        await asyncio.sleep(30)          # a park is a slew; long enough to stop
+        self.status = "parked"
 
 
 def _console(status="tracking"):
@@ -241,6 +244,84 @@ def test_park_needs_confirming():
     declined, after = asyncio.run(go())
     assert "park" not in declined, "parked without being confirmed"
     assert "park" in after, f"confirmed but never parked: {after}"
+
+
+def test_a_still_tracking_mount_is_not_called_stopped() -> None:
+    """"Stopped" has to mean stopped.
+
+    INDI's abort deliberately restores whatever the mount was doing before
+    the move -- inditelescope.cpp, "Abort shouldn't affect tracking state" --
+    so aborting from a tracking mount leaves it tracking, at sidereal rate,
+    over whatever patch of sky it stopped on. Framework behaviour, so the AM3
+    will do it too, not just the simulator.
+
+    Abort cancels the instruction. It does not stop the telescope, and the
+    line printed after it should not imply otherwise.
+    """
+    async def go():
+        tel, con = _console()
+        tel.status = "tracking"
+        said = []
+        import builtins
+        real = builtins.print
+        builtins.print = lambda *a, **k: said.append(" ".join(str(x) for x in a))
+        try:
+            await con._stop("testing")
+        finally:
+            builtins.print = real
+        return "\n".join(said)
+
+    out = asyncio.run(go())
+    assert "still tracking" in out, out
+    assert "stopped (tracking)" not in out, "called a tracking mount stopped"
+
+
+def test_an_idle_mount_is_still_called_stopped() -> None:
+    """The other half: do not make the honest case wordier."""
+    async def go():
+        tel, con = _console()
+        tel.status = "tracking"
+        said = []
+        import builtins
+        real = builtins.print
+        builtins.print = lambda *a, **k: said.append(" ".join(str(x) for x in a))
+        try:
+            async def idle():
+                return "idle"
+            tel.get_motion_status = idle
+            await con._stop("testing")
+        finally:
+            builtins.print = real
+        return "\n".join(said)
+
+    assert "stopped (idle)" in asyncio.run(go())
+
+
+def test_a_park_can_be_aborted() -> None:
+    """A park is the longest move of the night and must be interruptible.
+
+    Measured 2026-08-30: `park` was awaited straight from the command loop,
+    which blocked the prompt. An `abort` typed while it ran sat in the input
+    buffer until the park had finished, and was then answered with "nothing to
+    abort -- the telescope is parked". The mount was uninterruptible for the
+    whole swing across the sky and nothing said so.
+
+    A slew was already backgrounded and abortable. Park now uses the same
+    slot, so there is one idea -- the mount is moving under our command --
+    rather than two that behave differently.
+    """
+    async def run():
+        tel, con = _console()
+        _answers("y")                             # yes, park it
+        await con.do_park()
+        await asyncio.sleep(0.05)                # let it get going
+        assert con._busy(), "park did not register as the mount moving"
+        await con.do_abort()
+        return tel.calls
+
+    calls = asyncio.run(run())
+    assert "park" in calls, calls
+    assert "stop_motion" in calls, f"abort never reached the telescope: {calls}"
 
 
 if __name__ == "__main__":
