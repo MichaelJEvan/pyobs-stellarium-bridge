@@ -316,6 +316,14 @@ find out.
 Provided as-is, maintained when time allows. This is a side project outside
 academia, so responses may be slow.
 
+## Related repos
+
+- [pyobs-indi](https://github.com/MichaelJEvan/pyobs-indi):
+  drives INDI mounts (like a ZWO AM3N) from pyobs.
+- [pyobs-sim-container](https://github.com/MichaelJEvan/pyobs-sim-container):
+  ejabberd plus a simulated pyobs telescope in Docker, for running all of
+  this with no hardware.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Use it for anything, commercial or not; just
