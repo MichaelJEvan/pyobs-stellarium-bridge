@@ -57,15 +57,17 @@ def to_altaz(ra_deg: float, dec_deg: float, site: EarthLocation) -> tuple[float,
     return p.alt.degree, p.az.degree
 
 
-def meridian_minutes(ra_deg: float, site: EarthLocation) -> float:
+def meridian_minutes(ra_deg: float, dec_deg: float, site: EarthLocation) -> float:
     """Minutes until this RA crosses the meridian; negative means it already has.
 
     Hour angle is local sidereal time minus RA (of date, so the bridge's J2000
     value is precessed first). Negative HA is east of the meridian, heading
-    for it at one sidereal hour per hour.
+    for it at one sidereal hour per hour. The real declination matters for the
+    precession: its RA term scales with tan(dec), and plugging in dec 0 was
+    11 s of time off at Dec +68 (measured 2026-08-31).
     """
     now = Time.now()
-    eod = SkyCoord(ra_deg * u.deg, 0 * u.deg,
+    eod = SkyCoord(ra_deg * u.deg, dec_deg * u.deg,
                    frame=FK5(equinox="J2000")).transform_to(FK5(equinox=now))
     lst = now.sidereal_time("apparent", longitude=site.lon)
     ha = (lst - eod.ra).wrap_at(180 * u.deg).hourangle
@@ -267,7 +269,7 @@ def main() -> None:
         _, _, _, ra_raw, dec_raw, _ = struct.unpack("<HHQIii", data)
         ra, dec = raw_to_ra(ra_raw), raw_to_dec(dec_raw)
         alt, az = to_altaz(ra, dec, site)
-        state["meridian"] = meridian_minutes(ra, site)
+        state["meridian"] = meridian_minutes(ra, dec, site)
         moved = prev is not None and (abs(ra - prev[0]) > MOVING_THRESHOLD
                                       or abs(dec - prev[1]) > MOVING_THRESHOLD)
         prev = (ra, dec)
