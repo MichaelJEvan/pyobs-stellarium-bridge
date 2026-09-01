@@ -1,6 +1,6 @@
 # Stellarium ↔ pyobs bridge
 
-**Developer:** Michael J. Evan  
+**Developer:** Michael J Evan  
 Masters Computer Science  
 University of Massachusetts Dartmouth - Dec 2026  
 AAVSO member  
