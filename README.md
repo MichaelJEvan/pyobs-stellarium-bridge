@@ -10,7 +10,19 @@ A Python suite that connects a pyobs observatory to Stellarium. The telescope
 can be driven from Stellarium, from the terminal, or by pyobs itself — any
 telescope control commands can be observed in real-time from Stellarium.
 
-**Runs against pyobs-core 2.0.** Developed and verified on 2.0.1.
+**Runs against pyobs-core 2.x.** Developed on 2.0.1, current on 2.1.1.
+
+**Drives real hardware.** Since 2026-08-30 this suite has been running a real
+ZWO AM3N mount through [pyobs-indi](https://github.com/MichaelJEvan/pyobs-indi):
+first light landed 0.3 arcsec from the target, and hundreds of slews since sit
+in the log. Every slew commanded from Stellarium's sky chart moves the real
+mount, and the reticle follows it live. Meridian flips are automatic: the
+mount never flips itself, so the module watches the tracked target's hour
+angle and re-slews about 30 seconds past the crossing. Verified 2026-08-31
+with ten automatic flips on both sides of the sky, declinations -28 to +88,
+each re-acquiring the target within arcseconds while Stellarium tracked the
+whole swing. The pyobs simulator remains the test bed; the mount is the
+proof.
 
 <img width="1832" height="1448" alt="Stellarium_tracking" src="https://github.com/user-attachments/assets/ac605a5b-2a0e-44a9-a91c-19c8c8304481" />
 <img width="1832" height="1447" alt="pyobs_bridge_suite" src="https://github.com/user-attachments/assets/e508862b-86bb-4805-9e6f-1f6cb8a5d3b1" />
@@ -20,7 +32,9 @@ pyobs observatory control program / simulator, which reports the pyobs
 telescope's position in Stellarium once per second, providing a visual
 reference of pyobs tracking within Stellarium. A live terminal readout of
 where the telescope is pointing can be accessed via `nightwatch.py`, which reads
-from `bridge.py`.
+from `bridge.py` and includes a live countdown to the meridian crossing for
+whatever the mount is tracking, the moment that matters most on a mount that
+flips.
 
 `slewto.py` slews the pyobs telescope from the command line, independent of
 Stellarium and the bridge. It takes a target by name — stars, Messier, NGC,
@@ -262,7 +276,9 @@ either; it carries on making decisions.
 an empty method there, so a simulated slew could not be stopped; `scope.py`
 tries, fails, and says so rather than claiming success. pyobs 2.0 implements it, and it works: aborting a slew mid-flight stops the
 mount partway and reports the status it actually settled into. Verified on the
-2.0 simulator — not on real hardware.
+2.0 simulator and on the real AM3N (2026-08-31), with one INDI caveat: abort
+restores the pre-move state, so a mount that was tracking resumes tracking.
+Stopping it for real means tracking off, or park.
 
 **Losing the telescope mid-slew is reported at once.** pyobs gives
 `move_radec` twenty minutes before it times out, which suits a professional
@@ -334,13 +350,12 @@ chain restricts this.
 
 ## Known limits
 
-- **Never run against real hardware.** Every slew has been a simulator that
-  always answers and never jams.
 - **The slew-timeout fallback has never fired, and may never need to.**
   `move_radec` blocks for the whole move; on a timeout the bridge watches
   motion status rather than re-issuing the command. Tested with the simulator
   slowed to 0.5 deg/s: a slew blocking for **5 minutes 10 seconds** did not
   time out. So there is no short RPC timeout on that call. The code stays
   because a real driver may behave differently, but it is unexercised.
-- **One user, one client, one machine.** No dome, no scheduler, no weather
-  system competing for the mount.
+- **No dome, no scheduler, no weather system** competing for the mount yet.
+  Multiple clients watching and commanding one mount is exercised daily;
+  automated decision-makers are not.

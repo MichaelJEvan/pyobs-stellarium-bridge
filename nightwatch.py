@@ -31,7 +31,7 @@ import struct
 import sys
 import time
 
-from astropy.coordinates import AltAz, EarthLocation, SkyCoord
+from astropy.coordinates import FK5, AltAz, EarthLocation, SkyCoord
 from astropy.time import Time
 import astropy.units as u
 
@@ -55,6 +55,29 @@ def to_altaz(ra_deg: float, dec_deg: float, site: EarthLocation) -> tuple[float,
     frame = AltAz(obstime=Time.now(), location=site)
     p = SkyCoord(ra_deg * u.deg, dec_deg * u.deg).transform_to(frame)
     return p.alt.degree, p.az.degree
+
+
+def meridian_minutes(ra_deg: float, dec_deg: float, site: EarthLocation) -> float:
+    """Minutes until this RA crosses the meridian; negative means it already has.
+
+    Hour angle is local sidereal time minus RA (of date, so the bridge's J2000
+    value is precessed first). Negative HA is east of the meridian, heading
+    for it at one sidereal hour per hour. The real declination matters for the
+    precession: its RA term scales with tan(dec), and plugging in dec 0 was
+    11 s of time off at Dec +68 (measured 2026-08-31).
+    """
+    now = Time.now()
+    eod = SkyCoord(ra_deg * u.deg, dec_deg * u.deg,
+                   frame=FK5(equinox="J2000")).transform_to(FK5(equinox=now))
+    lst = now.sidereal_time("apparent", longitude=site.lon)
+    ha = (lst - eod.ra).wrap_at(180 * u.deg).hourangle
+    return float(-ha * 60.0 / 1.0027379)   # sidereal minutes -> clock minutes
+
+
+def meridian_line(minutes: float) -> str:
+    m = abs(minutes)
+    clock = f"{int(m // 60)}h {int(m % 60):02d}m" if m >= 60 else f"{int(m)}m {int(m % 1 * 60):02d}s"
+    return clock if minutes >= 0 else f"crossed {clock} ago"
 
 
 def ra_hms(ra_deg: float) -> str:
@@ -110,6 +133,9 @@ def render(state: dict, width: int = 80) -> list[str]:
         flag = "  BELOW HORIZON" if alt < 0 else ("  very low" if alt < 15 else "")
         lines.append(f"  Alt  {angle_dms(alt):>13} {alt:>9.4f}°{flag}")
         lines.append(f"  Az   {angle_dms(az):>13} {az:>9.4f}°")
+        if state.get("meridian") is not None:
+            lines.append("")
+            lines.append(f"  Meridian{meridian_line(state['meridian']):>20}")
 
     # Rule ends one character past the widest row, rather than running on to
     # the edge of the terminal.
@@ -192,7 +218,8 @@ def main() -> None:
 
     site = _site()
     tty = sys.stdout.isatty() and not args.once
-    state = {"ra": None, "dec": None, "motion": "connecting", "age": "",
+    state = {"ra": None, "dec": None, "meridian": None,
+             "motion": "connecting", "age": "",
              "note": "waiting for the bridge..."}
     prev = None
     last_packet = 0.0
@@ -242,6 +269,7 @@ def main() -> None:
         _, _, _, ra_raw, dec_raw, _ = struct.unpack("<HHQIii", data)
         ra, dec = raw_to_ra(ra_raw), raw_to_dec(dec_raw)
         alt, az = to_altaz(ra, dec, site)
+        state["meridian"] = meridian_minutes(ra, dec, site)
         moved = prev is not None and (abs(ra - prev[0]) > MOVING_THRESHOLD
                                       or abs(dec - prev[1]) > MOVING_THRESHOLD)
         prev = (ra, dec)
