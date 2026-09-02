@@ -75,7 +75,9 @@ def _telescope(proxy):
     2.0 resolves a proxy per call instead of caching one, so the fake has to
     come back from the comm each time rather than be pinned once.
     """
-    tel = PyobsTelescope()
+    # Pin the module name so the test does not ride config.yaml's live "module"
+    # (which is "indisim" now); the fake speaks for "telescope".
+    tel = PyobsTelescope(module="telescope")
     tel._comm = FakeComm(proxy)
     return tel
 

@@ -47,7 +47,11 @@ class FakeComm:
 
 
 def _telescope():
-    tel = PyobsTelescope()
+    # Pin the module name: the real default is read from config.yaml at import,
+    # which is set to whatever module is live (e.g. "indisim"). The fakes here
+    # speak for a module called "telescope", so the object under test must too,
+    # or module_visible never matches and every proxy fetch looks like a restart.
+    tel = PyobsTelescope(module="telescope")
     tel._comm = FakeComm()
     return tel
 
@@ -162,7 +166,7 @@ def test_an_event_arriving_during_resolution_is_not_lost():
             return _Ctx()
 
     async def run():
-        tel = PyobsTelescope()
+        tel = PyobsTelescope(module="telescope")   # pin the name (see _telescope)
         tel._comm = CommThatFiresMidResolve()
         tel._comm.tel = tel
         await tel._get_proxy()
